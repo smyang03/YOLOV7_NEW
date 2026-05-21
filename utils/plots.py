@@ -18,7 +18,7 @@ import yaml
 from PIL import Image, ImageDraw, ImageFont
 from scipy.signal import butter, filtfilt
 
-from utils.general import xywh2xyxy, xyxy2xywh
+from utils.general import xywh2xyxy, xyxy2xywh,clip_coords, increment_path
 from utils.metrics import fitness
 
 # Settings
@@ -42,6 +42,9 @@ def hist2d(x, y, n=100):
     yidx = np.clip(np.digitize(y, yedges) - 1, 0, hist.shape[1] - 1)
     return np.log(hist[xidx, yidx])
 
+def mosaicfuc(src, ratio=0.1):
+    small = cv2.resize(src, None, fx=ratio, fy=ratio, interpolation=cv2.INTER_NEAREST)
+    return cv2.resize(small, src.shape[:2][::-1], interpolation=cv2.INTER_NEAREST)
 
 def butter_lowpass_filtfilt(data, cutoff=1500, fs=50000, order=5):
     # https://stackoverflow.com/questions/28536191/how-to-filter-smooth-with-scipy-numpy
@@ -54,18 +57,42 @@ def butter_lowpass_filtfilt(data, cutoff=1500, fs=50000, order=5):
     return filtfilt(b, a, data)  # forward-backward filter
 
 
-def plot_one_box(x, img, color=None, label=None, line_thickness=3):
-    # Plots one bounding box on image img
+# def plot_one_box(x, img, color=None, label=None, line_thickness=5, mosaic=False):
+#     # Plots one bounding box on image imgs
+#     tl = line_thickness or round(2* (img.shape[0] + img.shape[1]) / 2) + 1  # line/font thickness
+#     color = color or [random.randint(0, 255) for _ in range(3)]
+#     c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
+
+#     if mosaic:
+#         img[c1[1]:c2[1],c1[0]:c2[0]] = mosaicfuc(img[c1[1]:c2[1],c1[0]:c2[0]], 0.1)
+#         cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
+#     else:
+#         cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
+#         if label:
+#             tf = max(tl - 1, 1)  # font thickness
+#             t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
+#             c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
+#             c3 = (c1[0] + 10,c1[1] + 20) 
+#             c4 = (c2[0] + 10,c2[1] + 10) 
+#             cv2.rectangle(img, c3, c4, color, -1, cv2.LINE_AA)  # filled
+#             cv2.putText(img, label, (c3[0], c3[1] - 2), 0, tl / 2.7, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
+
+def plot_one_box(x, img, color=None, label=None, line_thickness=5, mosaic=False, persondelete=False):
     tl = line_thickness or round(0.002 * (img.shape[0] + img.shape[1]) / 2) + 1  # line/font thickness
     color = color or [random.randint(0, 255) for _ in range(3)]
     c1, c2 = (int(x[0]), int(x[1])), (int(x[2]), int(x[3]))
-    cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
-    if label:
-        tf = max(tl - 1, 1)  # font thickness
-        t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
-        c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
-        cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)  # filled
-        cv2.putText(img, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
+    if mosaic:
+        img[c1[1]:c2[1],c1[0]:c2[0]] = mosaicfuc(img[c1[1]:c2[1],c1[0]:c2[0]], 0.1)
+        cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
+    else:
+        cv2.rectangle(img, c1, c2, color, thickness=tl, lineType=cv2.LINE_AA)
+        if label:
+            tf = max(tl - 1, 1)  # font thickness
+            t_size = cv2.getTextSize(label, 0, fontScale=tl / 3, thickness=tf)[0]
+            c2 = c1[0] + t_size[0], c1[1] - t_size[1] - 3
+            if persondelete == False:
+               cv2.rectangle(img, c1, c2, color, -1, cv2.LINE_AA)  # filled
+               cv2.putText(img, label, (c1[0], c1[1] - 2), 0, tl / 3, [225, 255, 255], thickness=tf, lineType=cv2.LINE_AA)
 
 
 def plot_one_box_PIL(box, img, color=None, label=None, line_thickness=None):
@@ -487,3 +514,19 @@ def plot_skeleton_kpts(im, kpts, steps, orig_shape=None):
         if pos2[0] % 640 == 0 or pos2[1] % 640 == 0 or pos2[0]<0 or pos2[1]<0:
             continue
         cv2.line(im, pos1, pos2, (int(r), int(g), int(b)), thickness=2)
+
+def save_one_box(xyxy, im, file=Path('im.jpg'), gain=1.02, pad=10, square=False, BGR=False, save=True):
+    # Save image crop as {file} with crop size multiple {gain} and {pad} pixels. Save and/or return crop
+    xyxy = torch.tensor(xyxy).view(-1, 4)
+    b = xyxy2xywh(xyxy)  # boxes
+    if square:
+        b[:, 2:] = b[:, 2:].max(1)[0].unsqueeze(1)  # attempt rectangle to square
+    b[:, 2:] = b[:, 2:] * gain + pad  # box wh * gain + pad
+    xyxy = xywh2xyxy(b).long()
+    clip_coords(xyxy, im.shape)
+    crop = im[int(xyxy[0, 1]):int(xyxy[0, 3]), int(xyxy[0, 0]):int(xyxy[0, 2]), ::(1 if BGR else -1)]
+    if save:
+        file.parent.mkdir(parents=True, exist_ok=True)  # make directory
+        f = str(increment_path(file).with_suffix('.jpg'))
+        Image.fromarray(crop[..., ::-1]).save(f, quality=95, subsampling=0)     # save RGB
+    return crop

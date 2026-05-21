@@ -1,0 +1,26 @@
+# WiSE-FT 테스트용 데이터 설정
+# 다중 검증 세트 예제
+
+# 학습 데이터 (실제 경로로 변경 필요)
+train: ./data/train.txt
+
+# 검증 데이터 (이 경로가 base가 됩니다)
+val: ./data/valid_all.txt
+
+# 클래스 수
+nc: 3
+
+# 클래스 이름
+names: ['person', 'car', 'dog']
+
+# 사용 방법:
+# python wiseft_sweep.py \
+#     --scratch models/600.pt \
+#     --finetuned models/620.pt \
+#     --data data/wiseft_test.yaml \
+#     --val-sets valid1 valid2 \
+#     --focus-range 0.1 \
+#     --enable-tradeoff-viz
+#
+# 주의: valid1.txt와 valid2.txt가 같은 디렉토리에 있어야 합니다.
+# 예: ./data/valid1.txt, ./data/valid2.txt

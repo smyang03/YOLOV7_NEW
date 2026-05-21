@@ -25,6 +25,8 @@ from copy import deepcopy
 #from pycocotools import mask as maskUtils
 from torchvision.utils import save_image
 from torchvision.ops import roi_pool, roi_align, ps_roi_pool, ps_roi_align
+import psutil
+import urllib.parse
 
 from utils.general import check_requirements, xyxy2xywh, xywh2xyxy, xywhn2xyxy, xyn2xy, segment2box, segments2boxes, \
     resample_segments, clean_str
@@ -33,7 +35,7 @@ from utils.torch_utils import torch_distributed_zero_first
 # Parameters
 help_url = 'https://github.com/ultralytics/yolov5/wiki/Train-Custom-Data'
 img_formats = ['bmp', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'dng', 'webp', 'mpo']  # acceptable image suffixes
-vid_formats = ['mov', 'avi', 'mp4', 'mpg', 'mpeg', 'm4v', 'wmv', 'mkv']  # acceptable video suffixes
+vid_formats = ['mov', 'avi', 'mp4', 'mpg', 'mpeg', 'm4v', 'wmv', 'mkv', 'ts']  # acceptable video suffixes
 logger = logging.getLogger(__name__)
 
 # Get orientation exif tag
@@ -60,10 +62,8 @@ def exif_size(img):
         pass
 
     return s
-
-
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
-                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix=''):
+                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='', close_mosaic=False):
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
         dataset = LoadImagesAndLabels(path, imgsz, batch_size,
@@ -75,20 +75,24 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                                       stride=int(stride),
                                       pad=pad,
                                       image_weights=image_weights,
-                                      prefix=prefix)
+                                      prefix=prefix,
+                                      close_mosaic=close_mosaic)  # close_mosaic 매개변수 추가
 
     batch_size = min(batch_size, len(dataset))
     nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
     sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
-    loader = torch.utils.data.DataLoader if image_weights else InfiniteDataLoader
+    loader = torch.utils.data.DataLoader if image_weights or close_mosaic else InfiniteDataLoader
+    
     # Use torch.utils.data.DataLoader() if dataset.properties will update during training else InfiniteDataLoader()
     dataloader = loader(dataset,
                         batch_size=batch_size,
                         num_workers=nw,
                         sampler=sampler,
                         pin_memory=True,
+                        persistent_workers=True,
                         collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
     return dataloader, dataset
+
 
 
 class InfiniteDataLoader(torch.utils.data.dataloader.DataLoader):
@@ -124,14 +128,168 @@ class _RepeatSampler(object):
         while True:
             yield from iter(self.sampler)
 
+class LoadImagestxt:
+    def __init__(self, pathtxt, img_size=640, stride=32):
+        # 초기화 및 설정
+        self.img_size = img_size
+        self.stride = stride
+        self.mode = 'image'
+        
+        # 파일 경로 로드
+        print(f'Reading image paths from {pathtxt}...')
+        try:
+            with open(str(pathtxt), 'r', encoding='utf-8') as file:
+                # 전체 라인 수를 먼저 확인
+                total_lines = sum(1 for _ in file)
+                file.seek(0)  # 파일 포인터를 다시 처음으로 이동
+                
+                # 진행 상태 표시하면서 파일 읽기
+                filelst = []
+                for i, line in enumerate(file):
+                    if i % 1000 == 0 or i == total_lines - 1:  # 1000줄마다 또는 마지막 줄에서 진행 상태 표시
+                        percent = (i + 1) / total_lines * 100
+                        print(f'Reading lines... [{i+1}/{total_lines}] {percent:.1f}%')
+                    
+                    line = line.strip()
+                    if os.path.isfile(line):
+                        filelst.append(line)
+                
+                print(f'Found {len(filelst)} valid files out of {total_lines} lines')
+        except UnicodeDecodeError:
+            # utf-8로 안되면 cp949로 시도
+            print('UTF-8 encoding failed, trying CP949...')
+            with open(str(pathtxt), 'r', encoding='cp949') as file:
+                # 전체 라인 수를 먼저 확인
+                total_lines = sum(1 for _ in file)
+                file.seek(0)  # 파일 포인터를 다시 처음으로 이동
+                
+                # 진행 상태 표시하면서 파일 읽기
+                filelst = []
+                for i, line in enumerate(file):
+                    if i % 1000 == 0 or i == total_lines - 1:  # 1000줄마다 또는 마지막 줄에서 진행 상태 표시
+                        percent = (i + 1) / total_lines * 100
+                        print(f'Reading lines... [{i+1}/{total_lines}] {percent:.1f}%')
+                    
+                    line = line.strip()
+                    if os.path.isfile(line):
+                        filelst.append(line)
+                
+                print(f'Found {len(filelst)} valid files out of {total_lines} lines')
+        
+        # 이미지와 비디오 파일 분류
+        images = [x for x in filelst if x.split('.')[-1].lower() in img_formats]
+        videos = [x for x in filelst if x.split('.')[-1].lower() in vid_formats]
+        
+        # 파일 개수 확인
+        ni, nv = len(images), len(videos)
+        self.nf = ni + nv  # total number of files
+        
+        # 파일 목록 저장
+        self.files = images + videos
+        self.video_flag = [False] * ni + [True] * nv
+        
+        # 데이터 로드 현황 출력
+        print(f'Found {ni} images and {nv} videos')
+        print(f'Total files to process: {self.nf}')
+        
+        # 비디오 캡처 초기화
+        self.cap = None
+        if any(videos):
+            self.new_video(videos[0])
+        
+        # 파일 존재 확인
+        assert self.nf > 0, (f'No images or videos found in {pathtxt}. '
+                        f'Supported formats are:\nimages: {img_formats}\nvideos: {vid_formats}')
+        
+        # 진행 상태 추적용 변수 추가
+        self.start_time = time.time()
+        self.processed_files = 0
 
+    def __iter__(self):
+        self.count = 0
+        self.start_time = time.time()  # 시작 시간 초기화
+        self.processed_files = 0       # 처리된 파일 수 초기화
+        return self
+
+    def __next__(self):
+        if self.count == self.nf:
+            print(f'All {self.nf} files processed in {time.time() - self.start_time:.2f} seconds')
+            raise StopIteration
+        
+        path = self.files[self.count]
+        
+        # 진행 상황 계산
+        percent_complete = (self.count / self.nf) * 100
+        elapsed_time = time.time() - self.start_time
+        
+        # 남은 시간 예상 (처리된 파일이 있는 경우만)
+        if self.count > 0:
+            files_per_second = self.count / elapsed_time
+            remaining_files = self.nf - self.count
+            estimated_remaining_time = remaining_files / files_per_second if files_per_second > 0 else 0
+            time_info = f' | ETA: {estimated_remaining_time:.1f}s'
+        else:
+            time_info = ''
+            
+        # 진행 바 생성 (20칸 기준)
+        bar_length = 20
+        filled_length = int(bar_length * self.count / self.nf)
+        progress_bar = '█' * filled_length + '░' * (bar_length - filled_length)
+            
+        # 비디오 처리
+        if self.video_flag[self.count]:
+            self.mode = 'video'
+            ret_val, img0 = self.cap.read()
+            
+            if not ret_val:
+                self.count += 1
+                self.cap.release()
+                if self.count == self.nf:  # last video
+                    print(f'All {self.nf} files processed in {time.time() - self.start_time:.2f} seconds')
+                    raise StopIteration
+                else:
+                    path = self.files[self.count]
+                    self.new_video(path)
+                    ret_val, img0 = self.cap.read()
+            
+            self.frame += 1
+            print(f'[{progress_bar}] {percent_complete:.1f}% | Video {self.count + 1}/{self.nf} (frame {self.frame}/{self.nframes}){time_info}: {path}')
+            
+        # 이미지 처리
+        else:
+            self.count += 1
+            img0 = cv2.imread(path)  # BGR
+            assert img0 is not None, f'Failed to load image: {path}'
+            print(f'[{progress_bar}] {percent_complete:.1f}% | Image {self.count}/{self.nf}{time_info}: {path}')
+        
+        # 이미지 전처리
+        img = letterbox(img0, self.img_size, stride=self.stride)[0]
+        img = img[:, :, ::-1].transpose(2, 0, 1)  # BGR to RGB, to 3x416x416
+        img = np.ascontiguousarray(img)
+        
+        return path, img, img0, self.cap
+
+    def new_video(self, path):
+        self.frame = 0
+        self.cap = cv2.VideoCapture(path)
+        self.nframes = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        # 진행 상태 정보를 추가한 메시지 출력
+        elapsed = time.time() - self.start_time if hasattr(self, 'start_time') else 0
+        print(f'Opening video [{self.count+1}/{self.nf}] (elapsed: {elapsed:.1f}s): {path} (total frames: {self.nframes})')
+
+    def __len__(self):
+        return self.nf
 class LoadImages:  # for inference
-    def __init__(self, path, img_size=640, stride=32):
-        p = str(Path(path).absolute())  # os-agnostic absolute path
+    def __init__(self, path, img_size=640, stride=32, recursive=False):
+        #p = str(Path(path).absolute())  # os-agnostic absolute path
+        p = str(Path(path))  # os-agnostic absolute path
         if '*' in p:
             files = sorted(glob.glob(p, recursive=True))  # glob
         elif os.path.isdir(p):
-            files = sorted(glob.glob(os.path.join(p, '*.*')))  # dir
+            if recursive:
+                files = sorted(glob.glob(os.path.join(p, '**', '*.*'), recursive=True))  # dir with subdirectories
+            else:
+                files = sorted(glob.glob(os.path.join(p, '*.*')))  # dir (no subdirectories)
         elif os.path.isfile(p):
             files = [p]  # files
         else:
@@ -183,8 +341,22 @@ class LoadImages:  # for inference
         else:
             # Read image
             self.count += 1
-            img0 = cv2.imread(path)  # BGR
-            assert img0 is not None, 'Image Not Found ' + path
+            img0 = None
+            while img0 is None:
+                try:
+                    input_array = np.fromfile(path, np.uint8)
+                    if input_array.size == 0:
+                        raise ValueError(f'Empty file: {path}')
+                    img0 = cv2.imdecode(input_array, cv2.IMREAD_COLOR)
+                    if img0 is None:
+                        raise ValueError(f'Failed to decode image: {path}')
+                except Exception as e:
+                    print(f'\nWarning: Skipping corrupted image - {path} ({e})')
+                    if self.count == self.nf:
+                        raise StopIteration
+                    path = self.files[self.count]
+                    self.count += 1
+            #img0 = cv2.imread(path)  # BGR
             #print(f'image {self.count}/{self.nf} {path}: ', end='')
 
         # Padded resize
@@ -316,6 +488,10 @@ class LoadStreams:  # multiple IP or RTSP cameras
                 self.imgs[index] = im if success else self.imgs[index] * 0
                 n = 0
             time.sleep(1 / self.fps)  # wait time
+            if self.fps != 0:
+                time.sleep(1 / self.fps)  # wait time
+            else:
+                time.sleep(0.2)   # in rtsp situation self.fps may be zero. to avoid div by zero, take constant sleep.
 
     def __iter__(self):
         self.count = -1
@@ -346,22 +522,25 @@ class LoadStreams:  # multiple IP or RTSP cameras
 
 def img2label_paths(img_paths):
     # Define label paths as a function of image paths
-    sa, sb = os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
+    sa, sb = os.sep + 'JPEGImages' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
     return ['txt'.join(x.replace(sa, sb, 1).rsplit(x.split('.')[-1], 1)) for x in img_paths]
 
 
-class LoadImagesAndLabels(Dataset):  # for training/testing
-    def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, image_weights=False,
-                 cache_images=False, single_cls=False, stride=32, pad=0.0, prefix=''):
+class LoadImagesAndLabels(Dataset):
+    def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, 
+                 image_weights=False, cache_images=False, single_cls=False, stride=32, pad=0.0, 
+                 prefix='', close_mosaic=False):  # 새 파라미터 추가
+        
         self.img_size = img_size
         self.augment = augment
         self.hyp = hyp
         self.image_weights = image_weights
         self.rect = False if image_weights else rect
-        self.mosaic = self.augment and not self.rect  # load 4 images at a time into a mosaic (only during training)
+        self.mosaic = self.augment and not self.rect  # 모자이크 활성화 조건
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
-        self.path = path        
+        self.path = path
+        self.close_mosaic = close_mosaic  # 새로 추가
         #self.albumentations = Albumentations() if augment else None
 
         try:
@@ -372,10 +551,24 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                     f += glob.glob(str(p / '**' / '*.*'), recursive=True)
                     # f = list(p.rglob('**/*.*'))  # pathlib
                 elif p.is_file():  # file
-                    with open(p, 'r') as t:
-                        t = t.read().strip().splitlines()
-                        parent = str(p.parent) + os.sep
-                        f += [x.replace('./', parent) if x.startswith('./') else x for x in t]  # local to global path
+                    # 다양한 인코딩으로 시도
+                    encodings = ['utf-8', 'cp949', 'euc-kr', 'latin1', 'utf-16']
+                    content = None
+                    
+                    for encoding in encodings:
+                        try:
+                            with open(p, 'r', encoding=encoding) as t:
+                                content = t.read().strip().splitlines()
+                            break
+                        except UnicodeDecodeError:
+                            continue
+                    
+                    if content is None:
+                        raise Exception(f'Could not decode file {p} with any encoding')
+                    
+                    t = content
+                    parent = str(p.parent) + os.sep
+                    f += [x.replace('./', parent) if x.startswith('./') else x for x in t]
                         # f += [p.parent / x.lstrip(os.sep) for x in t]  # local to global path (pathlib)
                 else:
                     raise Exception(f'{prefix}{p} does not exist')
@@ -445,6 +638,8 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
 
             self.batch_shapes = np.ceil(np.array(shapes) * img_size / stride + pad).astype(int) * stride
 
+        if cache_images and not self.check_cache_ram(prefix=prefix):
+            cache_images = False      
         # Cache images into memory for faster training (WARNING: large datasets may exceed system RAM)
         self.imgs = [None] * n
         if cache_images:
@@ -467,8 +662,24 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 pbar.desc = f'{prefix}Caching images ({gb / 1E9:.1f}GB)'
             pbar.close()
 
+    def check_cache_ram(self, safety_margin=0.1, prefix=''):
+        # Check image caching requirements vs available memory
+        b, gb = 0, 1 << 30  # bytes of cached images, bytes per gigabytes
+        n = min(self.n, 30)  # extrapolate from 30 random images
+        for _ in range(n):
+            im = cv2.imread(random.choice(self.img_files))  # sample image
+            ratio = self.img_size / max(im.shape[0], im.shape[1])  # max(h, w)  # ratio
+            b += im.nbytes * ratio ** 2
+        mem_required = b * self.n / n  # GB required to cache dataset into RAM
+        mem = psutil.virtual_memory()
+        cache = mem_required * (1 + safety_margin) < mem.available  # to cache or not to cache, that is the question
+        if not cache:
+            logger.info(f"{prefix}{mem_required / gb:.1f}GB RAM required, "
+                        f"{mem.available / gb:.1f}/{mem.total / gb:.1f}GB available, "
+                        f"{'caching images ?' if cache else 'not caching images ??'}")
+        return cache
     def cache_labels(self, path=Path('./labels.cache'), prefix=''):
-        # Cache dataset labels, check images and read shapes
+    # Cache dataset labels, check images and read shapes
         x = {}  # dict
         nm, nf, ne, nc = 0, 0, 0, 0  # number missing, found, empty, duplicate
         pbar = tqdm(zip(self.img_files, self.label_files), desc='Scanning images', total=len(self.img_files))
@@ -481,7 +692,7 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                 segments = []  # instance segments
                 assert (shape[0] > 9) & (shape[1] > 9), f'image size {shape} <10 pixels'
                 assert im.format.lower() in img_formats, f'invalid image format {im.format}'
-
+                
                 # verify labels
                 if os.path.isfile(lb_file):
                     nf += 1  # label found
@@ -496,7 +707,15 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
                         assert l.shape[1] == 5, 'labels require 5 columns each'
                         assert (l >= 0).all(), 'negative labels'
                         assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
-                        assert np.unique(l, axis=0).shape[0] == l.shape[0], 'duplicate labels'
+                        
+                        # 중복 레이블 처리: 삭제 대신 제거
+                        nl_original = len(l)
+                        unique_indices = np.unique(l, axis=0, return_index=True)[1]
+                        if len(unique_indices) < nl_original:  # 중복이 있는 경우
+                            l = l[unique_indices]  # 중복 제거
+                            if len(segments) > 0:  # 세그먼트 데이터가 있으면 동일하게 처리
+                                segments = [segments[idx] for idx in unique_indices]
+                            print(f'{prefix}WARNING: Removing {nl_original - len(unique_indices)} duplicate labels from {lb_file}')
                     else:
                         ne += 1  # label empty
                         l = np.zeros((0, 5), dtype=np.float32)
@@ -507,20 +726,74 @@ class LoadImagesAndLabels(Dataset):  # for training/testing
             except Exception as e:
                 nc += 1
                 print(f'{prefix}WARNING: Ignoring corrupted image and/or label {im_file}: {e}')
-
+                
             pbar.desc = f"{prefix}Scanning '{path.parent / path.stem}' images and labels... " \
                         f"{nf} found, {nm} missing, {ne} empty, {nc} corrupted"
         pbar.close()
-
+        
         if nf == 0:
             print(f'{prefix}WARNING: No labels found in {path}. See {help_url}')
-
+        
         x['hash'] = get_hash(self.label_files + self.img_files)
         x['results'] = nf, nm, ne, nc, i + 1
         x['version'] = 0.1  # cache version
         torch.save(x, path)  # save for next time
         logging.info(f'{prefix}New cache created: {path}')
         return x
+    # def cache_labels(self, path=Path('./labels.cache'), prefix=''):
+    #     # Cache dataset labels, check images and read shapes
+    #     x = {}  # dict
+    #     nm, nf, ne, nc = 0, 0, 0, 0  # number missing, found, empty, duplicate
+    #     pbar = tqdm(zip(self.img_files, self.label_files), desc='Scanning images', total=len(self.img_files))
+    #     for i, (im_file, lb_file) in enumerate(pbar):
+    #         try:
+    #             # verify images
+    #             im = Image.open(im_file)
+    #             im.verify()  # PIL verify
+    #             shape = exif_size(im)  # image size
+    #             segments = []  # instance segments
+    #             assert (shape[0] > 9) & (shape[1] > 9), f'image size {shape} <10 pixels'
+    #             assert im.format.lower() in img_formats, f'invalid image format {im.format}'
+
+    #             # verify labels
+    #             if os.path.isfile(lb_file):
+    #                 nf += 1  # label found
+    #                 with open(lb_file, 'r') as f:
+    #                     l = [x.split() for x in f.read().strip().splitlines()]
+    #                     if any([len(x) > 8 for x in l]):  # is segment
+    #                         classes = np.array([x[0] for x in l], dtype=np.float32)
+    #                         segments = [np.array(x[1:], dtype=np.float32).reshape(-1, 2) for x in l]  # (cls, xy1...)
+    #                         l = np.concatenate((classes.reshape(-1, 1), segments2boxes(segments)), 1)  # (cls, xywh)
+    #                     l = np.array(l, dtype=np.float32)
+    #                 if len(l):
+    #                     assert l.shape[1] == 5, 'labels require 5 columns each'
+    #                     assert (l >= 0).all(), 'negative labels'
+    #                     assert (l[:, 1:] <= 1).all(), 'non-normalized or out of bounds coordinate labels'
+    #                     assert np.unique(l, axis=0).shape[0] == l.shape[0], 'duplicate labels'
+    #                 else:
+    #                     ne += 1  # label empty
+    #                     l = np.zeros((0, 5), dtype=np.float32)
+    #             else:
+    #                 nm += 1  # label missing
+    #                 l = np.zeros((0, 5), dtype=np.float32)
+    #             x[im_file] = [l, shape, segments]
+    #         except Exception as e:
+    #             nc += 1
+    #             print(f'{prefix}WARNING: Ignoring corrupted image and/or label {im_file}: {e}')
+
+    #         pbar.desc = f"{prefix}Scanning '{path.parent / path.stem}' images and labels... " \
+    #                     f"{nf} found, {nm} missing, {ne} empty, {nc} corrupted"
+    #     pbar.close()
+
+    #     if nf == 0:
+    #         print(f'{prefix}WARNING: No labels found in {path}. See {help_url}')
+
+    #     x['hash'] = get_hash(self.label_files + self.img_files)
+    #     x['results'] = nf, nm, ne, nc, i + 1
+    #     x['version'] = 0.1  # cache version
+    #     torch.save(x, path)  # save for next time
+    #     logging.info(f'{prefix}New cache created: {path}')
+    #     return x
 
     def __len__(self):
         return len(self.img_files)
@@ -678,6 +951,11 @@ def load_image(self, index):
         return img, (h0, w0), img.shape[:2]  # img, hw_original, hw_resized
     else:
         return self.imgs[index], self.img_hw0[index], self.img_hw[index]  # img, hw_original, hw_resized
+def cache_images_to_disk(self, i):
+    # Saves an image as an *.npy file for faster loading
+    f = self.npy_files[i]
+    if not f.exists():
+        np.save(f.as_posix(), cv2.imread(self.im_files[i]))
 
 
 def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
@@ -693,6 +971,25 @@ def augment_hsv(img, hgain=0.5, sgain=0.5, vgain=0.5):
     img_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val))).astype(dtype)
     cv2.cvtColor(img_hsv, cv2.COLOR_HSV2BGR, dst=img)  # no return needed
 
+def augment_shapen(img, self):
+    hyp = self.hyp
+    value = random.random() 
+    if value < hyp['sharpen']:
+        value1 = random.random() 
+        if value1 > 0.55: #center kernel value ���� 
+            kernel_sharpen = np.array([[-1,-1,-1],
+                                       [-1, 9,-1],
+                                       [-1, -1,-1]])
+        else:
+            kernel_sharpen = np.array([[0, -1, 0],
+                                       [-1, 5,-1],
+                                       [0, -1, 0]])
+
+        sharpenimg = cv2.filter2D(img, -1, kernel_sharpen)
+        sumimg = cv2.addWeighted(img, 0.7, sharpenimg, 0.3, 0)
+        return sumimg
+    else:
+        return img
 
 def hist_equalize(img, clahe=True, bgr=False):
     # Equalize histogram on BGR image 'img' with img.shape(n,m,3) and range 0-255
@@ -1318,3 +1615,30 @@ def load_segmentations(self, index):
     #print(key)
     # /work/handsomejw66/coco17/
     return self.segs[key]
+def create_result_dirs(base_path):
+    # base_path�� Path ��ü�� ��ȯ
+    base_path = Path(base_path)
+    
+    dirs = {
+        'good_detect': base_path / 'good_detection',  # conf-thres�� �Ѵ� ���� Ž��
+        'low_conf': base_path / 'low_confidence',     # conf-thres�� ���� �ʴ� ���
+        'miss_detect': base_path / 'miss_detection',  # �̰��� ���̽�
+        'false_detect': base_path / 'false_detection', # ������ ���̽�
+        'background': base_path / 'background' # ������ ���̽�
+    }
+    
+    for dir_path in dirs.values():
+        dir_path.mkdir(parents=True, exist_ok=True)
+        (dir_path / 'JPEGImages').mkdir(parents=True, exist_ok=True)
+        (dir_path / 'labels').mkdir(parents=True, exist_ok=True)
+    return dirs
+
+def read_label_file(label_path):
+
+    boxes = []
+    if os.path.exists(label_path):
+        with open(label_path, 'r') as f:
+            for line in f:
+                cls, x, y, w, h = map(float, line.strip().split())
+                boxes.append([cls, x, y, w, h])
+    return boxes

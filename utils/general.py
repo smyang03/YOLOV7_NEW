@@ -110,7 +110,7 @@ def check_requirements(requirements='requirements.txt', exclude=()):
             pkg.require(r)
         except Exception as e:  # DistributionNotFound or VersionConflict if requirements not met
             n += 1
-            print(f"{prefix} {e.req} not found and is required by YOLOR, attempting auto-update...")
+            print(f"{prefix} {e.req} not found and is required by YOLO7, attempting auto-update...")
             print(subprocess.check_output(f"pip install '{e.req}'", shell=True).decode())
 
     if n:  # if packages updated
@@ -153,13 +153,27 @@ def check_file(file):
         return files[0]  # return file
 
 
-def check_dataset(dict):
+def check_dataset(data_dict):
     # Download dataset if not found locally
-    val, s = dict.get('val'), dict.get('download')
+    val, s = data_dict.get('val'), data_dict.get('download')
     if val and len(val):
-        val = [Path(x).resolve() for x in (val if isinstance(val, list) else [val])]  # val path
-        if not all(x.exists() for x in val):
-            print('\nWARNING: Dataset not found, nonexistent paths: %s' % [str(x) for x in val if not x.exists()])
+        # Support both single validation set (string) and multiple validation sets (list)
+        if isinstance(val, str):
+            val_paths = [Path(val).resolve()]
+        elif isinstance(val, list):
+            # Check if it's a list of strings or list of dicts
+            if all(isinstance(v, str) for v in val):
+                val_paths = [Path(v).resolve() for v in val]
+            elif all(isinstance(v, dict) for v in val):
+                # Extract 'path' from each dict
+                val_paths = [Path(v.get('path')).resolve() for v in val]
+            else:
+                raise ValueError(f"Invalid val config: mixed types in list")
+        else:
+            raise ValueError(f"Invalid val config type: {type(val)}")
+
+        if not all(x.exists() for x in val_paths):
+            print('\nWARNING: Dataset not found, nonexistent paths: %s' % [str(x) for x in val_paths if not x.exists()])
             if s and len(s):  # download script
                 print('Downloading %s ...' % s)
                 if s.startswith('http') and s.endswith('.zip'):  # URL
@@ -332,13 +346,21 @@ def scale_coords(img1_shape, coords, img0_shape, ratio_pad=None):
     clip_coords(coords, img0_shape)
     return coords
 
-
-def clip_coords(boxes, img_shape):
-    # Clip bounding xyxy bounding boxes to image shape (height, width)
-    boxes[:, 0].clamp_(0, img_shape[1])  # x1
-    boxes[:, 1].clamp_(0, img_shape[0])  # y1
-    boxes[:, 2].clamp_(0, img_shape[1])  # x2
-    boxes[:, 3].clamp_(0, img_shape[0])  # y2
+def clip_coords(boxes, shape):
+    if isinstance(boxes, torch.Tensor):  # faster individually
+        boxes[..., 0].clamp_(0, shape[1])  # x1
+        boxes[..., 1].clamp_(0, shape[0])  # y1
+        boxes[..., 2].clamp_(0, shape[1])  # x2
+        boxes[..., 3].clamp_(0, shape[0])  # y2
+    else:  # np.array (faster grouped)
+        boxes[..., [0, 2]] = boxes[..., [0, 2]].clip(0, shape[1])  # x1, x2
+        boxes[..., [1, 3]] = boxes[..., [1, 3]].clip(0, shape[0])  # y1, y2
+# def clip_coords(boxes, img_shape):
+#     # Clip bounding xyxy bounding boxes to image shape (height, width)
+#     boxes[:, 0].clamp_(0, img_shape[1])  # x1
+#     boxes[:, 1].clamp_(0, img_shape[0])  # y1
+#     boxes[:, 2].clamp_(0, img_shape[1])  # x2
+#     boxes[:, 3].clamp_(0, img_shape[0])  # y2
 
 
 def bbox_iou(box1, box2, x1y1x2y2=True, GIoU=False, DIoU=False, CIoU=False, eps=1e-7):
@@ -890,3 +912,126 @@ def increment_path(path, exist_ok=True, sep=''):
         i = [int(m.groups()[0]) for m in matches if m]  # indices
         n = max(i) + 1 if i else 2  # increment number
         return f"{path}{sep}{n}"  # update path
+    
+def increment_path(path, exist_ok=False, sep='', mkdir=False):
+    # Increment file or directory path, i.e. runs/exp --> runs/exp{sep}2, runs/exp{sep}3, ... etc.
+    path = Path(path)  # os-agnostic
+
+    if path.exists() and not exist_ok:
+        path, suffix = (path.with_suffix(''), path.suffix) if path.is_file() else (path, '')
+
+        dirs = glob.glob(f"{path}{sep}*")   # similar paths
+        matches = [re.search(rf"{path.stem}{sep}(\d+)", d) for d in dirs]
+        i = [int(m.groups()[0]) for m in matches if m]  # indices
+        n = max(i) + 1 if i else 2  # increment number
+        path = Path(f"{path}{sep}{n}{suffix}")  # increment path
+
+    if mkdir:
+        path.mkdir(parents=True, exist_ok=True) # make directory
+
+    return path
+# def calculate_iou(box1, box2):
+#     # box1: [x1, y1, x2, y2]
+#     # box2: [x1, y1, x2, y2]
+
+#     # Calculate the coordinates of the intersection rectangle
+#     x1 = max(box1[0] - box1[2] / 2, box2[0] - box2[2] / 2)
+#     y1 = max(box1[1] - box1[3] / 2, box2[1] - box2[3] / 2)
+#     x2 = min(box1[0] + box1[2] / 2, box2[0] + box2[2] / 2)
+#     y2 = min(box1[1] + box1[3] / 2, box2[1] + box2[3] / 2)
+
+#     # # If there's no intersection, iou is 0
+#     if x2 < x1 or y2 < y1:
+#         return 0.0
+
+#     # Calculate the areas of the two bounding boxes and the intersection
+#     box1_area = box1[2] * box1[3]
+#     box2_area = box2[2] * box2[3]
+#     intersection_area = (x2 - x1) * (y2 - y1)
+
+#     # Calculate the Union area
+#     union_area = box1_area + box2_area - intersection_area
+
+#     # Calculate IoU
+#     iou = intersection_area / union_area
+
+#     return iou
+
+def calculate_iou(box1, box2):
+    """
+    box format: [x_center, y_center, width, height]
+    """
+    # 중심점, 너비, 높이를 좌상단, 우하단 좌표로 변환
+    box1_x1 = box1[0] - box1[2]/2
+    box1_y1 = box1[1] - box1[3]/2
+    box1_x2 = box1[0] + box1[2]/2
+    box1_y2 = box1[1] + box1[3]/2
+    
+    box2_x1 = box2[0] - box2[2]/2
+    box2_y1 = box2[1] - box2[3]/2
+    box2_x2 = box2[0] + box2[2]/2
+    box2_y2 = box2[1] + box2[3]/2
+    
+    # 교차 영역 계산
+    x1 = max(box1_x1, box2_x1)
+    y1 = max(box1_y1, box2_y1)
+    x2 = min(box1_x2, box2_x2)
+    y2 = min(box1_y2, box2_y2)
+    
+    intersection = max(0, x2 - x1) * max(0, y2 - y1)
+    box1_area = box1[2] * box1[3]
+    box2_area = box2[2] * box2[3]
+    union = box1_area + box2_area - intersection
+    
+    return intersection / union if union > 0 else 0
+
+
+# def calculate_iou(box1, box2,img_width, img_height):
+#     # box = (x1, y1, x2, y2)
+#     x1, y1, w1, h1 = box1
+#     x2, y2, w2, h2 = box2
+
+#     x1 = int(x1 * img_width)
+#     y1 = int(y1 * img_height)
+#     w1 = int(w1 * img_width)
+#     h1 = int(h1 * img_height)
+
+#     x2 = int(x2 * img_width)
+#     y2 = int(y2 * img_height)
+#     w2 = int(w2 * img_width)
+#     h2 = int(h2 * img_height)
+
+#     # 좌상단, 우하단 좌표 계산
+#     left = max(x1, x2)
+#     top = max(y1, y2)
+#     right = min(x1 + w1, x2 + w2)
+#     bottom = min(y1 + h1, y2 + h2)
+
+#     # 겹치는 영역의 넓이 계산
+#     intersection_area = max(0, right - left) * max(0, bottom - top)
+
+#     # 두 경계 상자의 넓이 계산
+#     box1_area = w1 * h1
+#     box2_area = w2 * h2
+
+#     # IoU 계산
+#     iou = intersection_area / (box1_area + box2_area - intersection_area)
+#     return iou
+
+def iou_filter(box1, box2, threshold=0.35):
+    correct = False
+    score = 0.0
+    labelcheck = np.zeros(len(box2), dtype=bool)
+    for j in range(len(box2)):
+        iou_score = calculate_iou(box1, box2[j])
+        
+        if iou_score >= threshold:
+            correct = True
+            score = iou_score
+            labelcheck[j] = True
+        else:
+            labelcheck[j] = False
+
+    return score, correct,labelcheck
+
+ 

@@ -47,8 +47,13 @@ def init_torch_seeds(seed=0):
 
 def date_modified(path=__file__):
     # return human-readable file modification date, i.e. '2021-3-26'
-    t = datetime.datetime.fromtimestamp(Path(path).stat().st_mtime)
-    return f'{t.year}-{t.month}-{t.day}'
+    try:
+        t = datetime.datetime.fromtimestamp(Path(path).stat().st_mtime)
+        return f'{t.year}-{t.month}-{t.day}'
+    except Exception:
+        # 파일을 찾을 수 없는 경우 현재 날짜 반환
+        t = datetime.datetime.now()
+        return f'{t.year}-{t.month}-{t.day}'
 
 
 def git_describe(path=Path(__file__).parent):  # path must be a directory
@@ -62,7 +67,7 @@ def git_describe(path=Path(__file__).parent):  # path must be a directory
 
 def select_device(device='', batch_size=None):
     # device = 'cpu' or '0' or '0,1,2,3'
-    s = f'YOLOR 🚀 {git_describe() or date_modified()} torch {torch.__version__} '  # string
+    s = f'YOLOv7  🚀 {git_describe() or date_modified()} torch {torch.__version__} '  # string
     cpu = device.lower() == 'cpu'
     if cpu:
         os.environ['CUDA_VISIBLE_DEVICES'] = '-1'  # force torch.cuda.is_available() = False

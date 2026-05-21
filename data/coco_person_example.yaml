@@ -1,0 +1,41 @@
+# COCO + Custom Person 데이터셋 예시
+# WiSE-FT README에서 사용된 실제 예시 시나리오
+
+# 학습 데이터
+train: ./data/coco_person/train.txt
+
+# 검증 데이터 - 2개 세트 사용
+val:
+  - ./data/coco_person/val_coco.txt        # COCO 검증 세트 (일반 성능 측정)
+  - ./data/coco_person/val_custom.txt      # Custom person 검증 세트 (타겟 성능 측정)
+
+# 테스트 데이터 (선택사항)
+test: ./data/coco_person/test.txt
+
+# 클래스 수
+nc: 80
+
+# 클래스 이름 (COCO 80개 클래스)
+names: ['person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train', 'truck', 'boat', 'traffic light',
+        'fire hydrant', 'stop sign', 'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+        'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella', 'handbag', 'tie', 'suitcase', 'frisbee',
+        'skis', 'snowboard', 'sports ball', 'kite', 'baseball bat', 'baseball glove', 'skateboard', 'surfboard',
+        'tennis racket', 'bottle', 'wine glass', 'cup', 'fork', 'knife', 'spoon', 'bowl', 'banana', 'apple',
+        'sandwich', 'orange', 'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair', 'couch',
+        'potted plant', 'bed', 'dining table', 'toilet', 'tv', 'laptop', 'mouse', 'remote', 'keyboard', 'cell phone',
+        'microwave', 'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase', 'scissors', 'teddy bear',
+        'hair drier', 'toothbrush']
+
+# ============================================================
+# WiSE-FT 사용 예시 (README 실제 예시):
+# ============================================================
+# python wiseft_sweep.py \
+#     --scratch runs/coco/weights/best.pt \
+#     --finetuned runs/person_finetuned/weights/best.pt \
+#     --data data/coco_person_example.yaml \
+#     --target-class person
+#
+# 결과:
+# - val_coco.txt: 일반 객체 탐지 성능 측정 (car, dog 등)
+# - val_custom.txt: person 타겟 성능 측정
+# - 최적 알파로 두 성능의 균형 달성

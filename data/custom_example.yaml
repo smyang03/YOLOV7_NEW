@@ -1,0 +1,35 @@
+# 커스텀 데이터셋 예시 - 다중 검증 세트 사용
+# WiSE-FT 도구와 함께 사용하기 위한 예시
+
+# 학습 데이터 경로
+train: ./data/images/train/  # 디렉토리 경로
+# 또는
+# train: ./data/train.txt     # 이미지 경로가 담긴 텍스트 파일
+
+# 검증 데이터 경로 - 방법 1: 리스트 형식 (YAML 스타일)
+val:
+  - ./data/images/val_indoor/    # 실내 데이터
+  - ./data/images/val_outdoor/   # 실외 데이터
+
+# 검증 데이터 경로 - 방법 2: 리스트 형식 (한 줄)
+# val: [./data/val_indoor.txt, ./data/val_outdoor.txt]
+
+# 테스트 데이터 (선택사항)
+test: ./data/images/test/
+
+# 클래스 수
+nc: 3
+
+# 클래스 이름 리스트 (인덱스 순서대로)
+names: ['person', 'car', 'dog']
+
+# ============================================================
+# WiSE-FT 사용 예시:
+# ============================================================
+# python wiseft_sweep.py \
+#     --scratch runs/scratch/weights/best.pt \
+#     --finetuned runs/finetuned/weights/best.pt \
+#     --data data/custom_example.yaml \
+#     --target-class person
+#
+# 위 명령은 val의 두 세트 모두에서 평가를 수행합니다.

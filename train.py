@@ -1,4 +1,5 @@
 import argparse
+import datetime
 import logging
 import math
 import os
@@ -34,6 +35,10 @@ from utils.loss import ComputeLoss, ComputeLossOTA
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
+import os
+import time
+import gc
+os.environ['KMP_DUPLICATE_LIB_OK']='True'
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +65,7 @@ def train(hyp, opt, device, tb_writer=None):
     plots = not opt.evolve  # create plots
     cuda = device.type != 'cpu'
     init_seeds(2 + rank)
-    with open(opt.data) as f:
+    with open(opt.data, encoding='UTF8') as f:
         data_dict = yaml.load(f, Loader=yaml.SafeLoader)  # data dict
     is_coco = opt.data.endswith('coco.yaml')
 
@@ -96,7 +101,28 @@ def train(hyp, opt, device, tb_writer=None):
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  # check
     train_path = data_dict['train']
-    test_path = data_dict['val']
+
+    # Support both single validation set (string) and multiple validation sets (list)
+    val_config = data_dict['val']
+    if isinstance(val_config, str):
+        val_configs = [{'path': val_config, 'name': 'val'}]
+    elif isinstance(val_config, list):
+        # Check if it's a list of strings or list of dicts
+        if all(isinstance(v, str) for v in val_config):
+            val_configs = [{'path': v, 'name': f'val_{i}'} for i, v in enumerate(val_config)]
+        elif all(isinstance(v, dict) for v in val_config):
+            # List of dicts with 'path' and optional 'name' keys
+            val_configs = [{'path': v.get('path', v), 'name': v.get('name', f'val_{i}')} for i, v in enumerate(val_config)]
+        else:
+            raise ValueError(f"Invalid val config: mixed types in list")
+    else:
+        raise ValueError(f"Invalid val config type: {type(val_config)}")
+
+    logger.info(f"Validation sets: {[cfg['name'] for cfg in val_configs]}")
+
+    # Validate that we have at least one validation set
+    if len(val_configs) == 0:
+        raise ValueError("No validation sets found in data.yaml. Please specify at least one validation set.")
 
     # Freeze
     freeze = [f'model.{x}.' for x in (freeze if len(freeze) > 1 else range(freeze[0]))]  # parameter names to freeze (full or partial)
@@ -242,20 +268,41 @@ def train(hyp, opt, device, tb_writer=None):
         logger.info('Using SyncBatchNorm()')
 
     # Trainloader
-    dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
-                                            hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
-                                            world_size=opt.world_size, workers=opt.workers,
-                                            image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '))
+# train.py의 250번째 줄 근처 수정
+    if hasattr(create_dataloader, '__code__') and 'close_mosaic' in create_dataloader.__code__.co_varnames:
+        dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
+                                                hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
+                                                world_size=opt.world_size, workers=opt.workers,
+                                                image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '),
+                                                close_mosaic=opt.close_mosaic > 0)
+    else:
+        dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
+                                                hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
+                                                world_size=opt.world_size, workers=opt.workers,
+                                                image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '))
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
 
     # Process 0
     if rank in [-1, 0]:
-        testloader = create_dataloader(test_path, imgsz_test, batch_size * 2, gs, opt,  # testloader
-                                       hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
-                                       world_size=opt.world_size, workers=opt.workers,
-                                       pad=0.5, prefix=colorstr('val: '))[0]
+        # Create dataloaders for all validation sets
+        testloaders = []
+        for val_cfg in val_configs:
+            val_path = val_cfg['path']
+            val_name = val_cfg['name']
+            if hasattr(create_dataloader, '__code__') and 'close_mosaic' in create_dataloader.__code__.co_varnames:
+                testloader = create_dataloader(val_path, imgsz_test, batch_size * 2, gs, opt,
+                                            hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
+                                            world_size=opt.world_size, workers=opt.workers,
+                                            pad=0.5, prefix=colorstr(f'{val_name}: '),
+                                            close_mosaic=False)[0]  # 검증에서는 항상 False
+            else:
+                testloader = create_dataloader(val_path, imgsz_test, batch_size * 2, gs, opt,
+                                            hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
+                                            world_size=opt.world_size, workers=opt.workers,
+                                            pad=0.5, prefix=colorstr(f'{val_name}: '))[0]
+            testloaders.append((val_name, testloader))
 
         if not opt.resume:
             labels = np.concatenate(dataset.labels, 0)
@@ -306,6 +353,14 @@ def train(hyp, opt, device, tb_writer=None):
     torch.save(model, wdir / 'init.pt')
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         model.train()
+
+        # Close mosaic augmentation        
+        logger.info(f"current {epoch}, epochs{epochs}, close mosaic{opt.close_mosaic}, epochs - opt.close_mosaic {epochs - opt.close_mosaic}")
+        if opt.close_mosaic > 0 and epoch == (epochs - opt.close_mosaic):
+            logger.info(f"Closing mosaic augmentation at epoch {epoch}")
+            dataset.mosaic = False
+            if hasattr(dataloader, 'dataset'):
+                dataloader.dataset.mosaic = False
 
         # Update image weights (optional)
         if opt.image_weights:
@@ -412,23 +467,173 @@ def train(hyp, opt, device, tb_writer=None):
             final_epoch = epoch + 1 == epochs
             if not opt.notest or final_epoch:  # Calculate mAP
                 wandb_logger.current_epoch = epoch + 1
-                results, maps, times = test.test(data_dict,
-                                                 batch_size=batch_size * 2,
-                                                 imgsz=imgsz_test,
-                                                 model=ema.ema,
-                                                 single_cls=opt.single_cls,
-                                                 dataloader=testloader,
-                                                 save_dir=save_dir,
-                                                 verbose=nc < 50 and final_epoch,
-                                                 plots=plots and final_epoch,
-                                                 wandb_logger=wandb_logger,
-                                                 compute_loss=compute_loss,
-                                                 is_coco=is_coco,
-                                                 v5_metric=opt.v5_metric)
 
-            # Write
-            with open(results_file, 'a') as f:
-                f.write(s + '%10.4g' * 7 % results + '\n')  # append metrics, val_loss
+                # Evaluate on all validation sets
+                all_val_results = []
+                for val_name, testloader in testloaders:
+                    logger.info(f'\n{"="*60}\nEvaluating on {val_name}\n{"="*60}')
+                    results, maps, times, per_class = test.test(data_dict,
+                                                     batch_size=batch_size * 2,
+                                                     imgsz=imgsz_test,
+                                                     model=ema.ema,
+                                                     single_cls=opt.single_cls,
+                                                     dataloader=testloader,
+                                                     save_dir=save_dir,
+                                                     verbose=True,  # Always verbose for class-wise results
+                                                     plots=plots and final_epoch,
+                                                     wandb_logger=wandb_logger,
+                                                     compute_loss=compute_loss,
+                                                     is_coco=is_coco,
+                                                     v5_metric=opt.v5_metric)
+                    all_val_results.append({
+                        'name': val_name,
+                        'results': results,
+                        'maps': maps,
+                        'times': times,
+                        'per_class': per_class
+                    })
+
+                # Log combined results if multiple validation sets exist
+                if len(all_val_results) > 1:
+                    logger.info(f'\n{"="*60}\nCombined Results (Average)\n{"="*60}')
+
+                    # Calculate average overall metrics
+                    combined_results = np.mean([vr['results'] for vr in all_val_results], axis=0)
+                    pf = '%20s' + '%12s' * 2 + '%12.3g' * 4
+                    logger.info(pf % ('all', '-', '-', combined_results[0], combined_results[1], combined_results[2], combined_results[3]))
+
+                    # Calculate and log average per-class metrics
+                    all_class_names = set()
+                    for val_result in all_val_results:
+                        if val_result['per_class'] is not None:
+                            names = val_result['per_class']['names']
+                            for c in val_result['per_class']['ap_class']:
+                                all_class_names.add(names[c])
+
+                    for class_name in sorted(all_class_names):
+                        class_metrics = []
+                        class_images = []
+                        for val_result in all_val_results:
+                            per_class = val_result['per_class']
+                            if per_class is not None:
+                                names = per_class['names']
+                                for i, c in enumerate(per_class['ap_class']):
+                                    if names[c] == class_name:
+                                        class_metrics.append([
+                                            per_class['p'][i],
+                                            per_class['r'][i],
+                                            per_class['ap50'][i],
+                                            per_class['ap'][i]
+                                        ])
+                                        class_images.append(per_class['nt'][c])
+                                        break
+
+                        if class_metrics:
+                            avg_metrics = np.mean(class_metrics, axis=0)
+                            total_images = sum(class_images)
+                            logger.info(pf % (class_name, '-', total_images, avg_metrics[0], avg_metrics[1], avg_metrics[2], avg_metrics[3]))
+
+                # Select validation set for best model selection based on --best-val-set option
+                best_val_set = opt.best_val_set
+                if best_val_set == 'first':
+                    results = all_val_results[0]['results']
+                    maps = all_val_results[0]['maps']
+                    logger.info(f'Using {all_val_results[0]["name"]} for best model selection')
+                elif best_val_set == 'last':
+                    results = all_val_results[-1]['results']
+                    maps = all_val_results[-1]['maps']
+                    logger.info(f'Using {all_val_results[-1]["name"]} for best model selection')
+                elif best_val_set == 'Combined' or best_val_set == 'combined':
+                    # Use average of all validation sets
+                    if len(all_val_results) > 1:
+                        results = tuple(np.mean([vr['results'] for vr in all_val_results], axis=0))
+                        # For maps, average across all validation sets
+                        all_maps = np.array([vr['maps'] for vr in all_val_results])
+                        maps = np.mean(all_maps, axis=0)
+                        logger.info('Using Combined (average) results for best model selection')
+                    else:
+                        results = all_val_results[0]['results']
+                        maps = all_val_results[0]['maps']
+                        logger.info(f'Only one validation set available, using {all_val_results[0]["name"]}')
+                else:
+                    # Find specific validation set by name
+                    found = False
+                    for val_result in all_val_results:
+                        if val_result['name'] == best_val_set:
+                            results = val_result['results']
+                            maps = val_result['maps']
+                            logger.info(f'Using {best_val_set} for best model selection')
+                            found = True
+                            break
+                    if not found:
+                        logger.warning(f'Validation set "{best_val_set}" not found. Using first validation set: {all_val_results[0]["name"]}')
+                        results = all_val_results[0]['results']
+                        maps = all_val_results[0]['maps']
+
+                # Write results to file
+                with open(results_file, 'a') as f:
+                    # Write epoch and training loss
+                    f.write(s)
+
+                    # Write results for each validation set
+                    for val_result in all_val_results:
+                        val_name = val_result['name']
+                        val_res = val_result['results']
+                        per_class = val_result['per_class']
+
+                        # Write overall metrics for this validation set
+                        f.write(f"  [{val_name:>12s}] " + '%11.4g' * 7 % val_res + '\n')
+
+                        # Write per-class results if available
+                        if per_class is not None:
+                            names = per_class['names']
+                            for i, c in enumerate(per_class['ap_class']):
+                                class_name = names[c]
+                                p_i = per_class['p'][i]
+                                r_i = per_class['r'][i]
+                                ap50_i = per_class['ap50'][i]
+                                ap_i = per_class['ap'][i]
+                                nt_i = per_class['nt'][c]
+                                f.write(f"    [{val_name:>12s}][{class_name:>15s}] Images: {nt_i:>5}, P: {p_i:>10.4g}, R: {r_i:>10.4g}, mAP@.5: {ap50_i:>10.4g}, mAP@.5:.95: {ap_i:>10.4g}\n")
+
+                    # Calculate and write combined (average) results across all validation sets
+                    if len(all_val_results) > 1:
+                        # Average the overall metrics
+                        combined_results = np.mean([vr['results'] for vr in all_val_results], axis=0)
+                        f.write(f"  [{'Combined':>12s}] " + '%11.4g' * 7 % tuple(combined_results) + '\n')
+
+                        # Combine per-class results
+                        # Collect all unique classes across validation sets
+                        all_class_names = set()
+                        for val_result in all_val_results:
+                            if val_result['per_class'] is not None:
+                                names = val_result['per_class']['names']
+                                for c in val_result['per_class']['ap_class']:
+                                    all_class_names.add(names[c])
+
+                        # Calculate average per-class metrics
+                        for class_name in sorted(all_class_names):
+                            class_metrics = []
+                            class_images = []
+                            for val_result in all_val_results:
+                                per_class = val_result['per_class']
+                                if per_class is not None:
+                                    names = per_class['names']
+                                    for i, c in enumerate(per_class['ap_class']):
+                                        if names[c] == class_name:
+                                            class_metrics.append([
+                                                per_class['p'][i],
+                                                per_class['r'][i],
+                                                per_class['ap50'][i],
+                                                per_class['ap'][i]
+                                            ])
+                                            class_images.append(per_class['nt'][c])
+                                            break
+
+                            if class_metrics:
+                                avg_metrics = np.mean(class_metrics, axis=0)
+                                total_images = sum(class_images)
+                                f.write(f"    [{'Combined':>12s}][{class_name:>15s}] Images: {total_images:>5}, P: {avg_metrics[0]:>10.4g}, R: {avg_metrics[1]:>10.4g}, mAP@.5: {avg_metrics[2]:>10.4g}, mAP@.5:.95: {avg_metrics[3]:>10.4g}\n")
             if len(opt.name) and opt.bucket:
                 os.system('gsutil cp %s gs://%s/results/results%s.txt' % (results_file, opt.bucket, opt.name))
 
@@ -458,25 +663,33 @@ def train(hyp, opt, device, tb_writer=None):
                         'ema': deepcopy(ema.ema).half(),
                         'updates': ema.updates,
                         'optimizer': optimizer.state_dict(),
-                        'wandb_id': wandb_logger.wandb_run.id if wandb_logger.wandb else None}
+                        'wandb_id': wandb_logger.wandb_run.id if wandb_logger.wandb else None,
+                        'mosaic_active': dataset.mosaic}  # mosaic 상태 추가
 
                 # Save last, best and delete
-                torch.save(ckpt, last)
-                if best_fitness == fi:
-                    torch.save(ckpt, best)
-                if (best_fitness == fi) and (epoch >= 200):
-                    torch.save(ckpt, wdir / 'best_{:03d}.pt'.format(epoch))
-                if epoch == 0:
+                if opt.model_saveoptimizer:
+                    # optimizer 제거하고 저장 (가벼운 모델만)
+                    torch.save(ckpt, last)
                     torch.save(ckpt, wdir / 'epoch_{:03d}.pt'.format(epoch))
-                elif ((epoch+1) % 25) == 0:
+                    if best_fitness == fi:
+                        torch.save(ckpt, wdir / 'best_{:03d}.pt'.format(epoch))
+                        torch.save(ckpt, wdir / 'best.pt'.format(epoch))
+                    
+                    # 저장 후 optimizer 제거
+                    strip_optimizer(last)
+                    strip_optimizer(wdir / 'epoch_{:03d}.pt'.format(epoch))
+                    if best_fitness == fi:
+                        strip_optimizer(wdir / 'best_{:03d}.pt'.format(epoch))
+                        strip_optimizer(wdir / 'best.pt'.format(epoch))
+                else:
+                    # optimizer 포함해서 저장 (원본 ckpt 그대로)
+                    torch.save(ckpt, last)
                     torch.save(ckpt, wdir / 'epoch_{:03d}.pt'.format(epoch))
-                elif epoch >= (epochs-5):
-                    torch.save(ckpt, wdir / 'epoch_{:03d}.pt'.format(epoch))
-                if wandb_logger.wandb:
-                    if ((epoch + 1) % opt.save_period == 0 and not final_epoch) and opt.save_period != -1:
-                        wandb_logger.log_model(
-                            last.parent, opt, epoch, fi, best_model=best_fitness == fi)
+                    if best_fitness == fi:
+                        torch.save(ckpt, wdir / 'best_{:03d}.pt'.format(epoch))
                 del ckpt
+                torch.cuda.empty_cache()
+                gc.collect()
 
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training
@@ -562,6 +775,11 @@ if __name__ == '__main__':
     parser.add_argument('--artifact_alias', type=str, default="latest", help='version of dataset artifact to be used')
     parser.add_argument('--freeze', nargs='+', type=int, default=[0], help='Freeze layers: backbone of yolov7=50, first3=0 1 2')
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
+    parser.add_argument('--close-mosaic', type=int, default=0, help='close mosaic augmentation (epochs)')  # close_mosaic 인자 추가
+    parser.add_argument('--model-saveoptimizer', action='store_true', help='Save model optimizer state')
+    parser.add_argument('--best-val-set', type=str, default='first',
+                        help='Validation set to use for best model selection (first, last, Combined, test1, test2, etc.)')
+
     opt = parser.parse_args()
 
     # Set DDP variables
