@@ -13,7 +13,11 @@
 
 ## 문서 저장 규칙
 
-Markdown 문서는 목적별 폴더에 분리해 저장합니다. 버그와 회귀 이슈는 `doc/BUG/`, 개발 계획과 작업 분해는 `doc/PLAN/`, 검토 결과와 완료 리포트는 `doc/REPORT/`에 둡니다. 파일명은 내용을 드러내는 `snake_case`와 날짜를 함께 사용합니다. 예: `doc/BUG/code_review_regressions_2026-05-21.md`, `doc/PLAN/phase_training_plan_2026-05-21.md`.
+Markdown 문서는 목적별 폴더에 분리해 저장합니다. 버그와 회귀 이슈는 `doc/BUG/`, 개발 문서와 작업 분해 문서는 `doc/PLAN/`, 검토 결과와 완료 리포트는 `doc/REPORT/`에 둡니다. 코드레벨 개발 요구서도 신규 작성 또는 수정 시 `doc/PLAN/`에 저장합니다. 파일명은 내용을 드러내는 `snake_case`와 날짜를 함께 사용합니다. 예: `doc/BUG/code_review_regressions_2026-05-21.md`, `doc/PLAN/phase_training_plan_2026-05-21.md`, `doc/PLAN/development_requirements_1.3.1_baseline_export.md`.
+
+## 계획 문서 범위 기준
+
+`doc/PLAN/`의 개발 문서는 학습, 평가, Python export, 검증 도구를 우선 대상으로 합니다. C++ 후처리, TensorRT runtime, 별도 추론 서버, 운영 배포 코드는 사용자가 명시적으로 요청하기 전까지 개발 범위에서 제외합니다. 추론/배포 관련 항목이 필요하면 `doc/PLAN/`에 별도 차수로 분리한 뒤 코드레벨 요구서도 `doc/PLAN/`에 작성합니다.
 
 ## 빌드, 테스트, 개발 명령
 
@@ -53,7 +57,7 @@ Python 3 기준으로 4칸 들여쓰기를 사용합니다. 기존 YOLOv7 스타
 
 ## 테스트 지침
 
-별도 unit test suite는 없습니다. 변경 범위에 맞는 가장 작은 검증을 수행합니다. Dataset 변경은 `test.py`, 학습 루프 변경은 짧은 `--epochs 1` smoke run, export 변경은 `export.py`로 확인합니다. TensorRT/ONNX 관련 변경은 완료 처리 전에 PyTorch 출력과 export 출력이 일치하는지 비교합니다.
+별도 unit test suite는 없습니다. 변경 범위에 맞는 가장 작은 검증을 수행합니다. Dataset 변경은 `test.py`, 학습 루프 변경은 짧은 `--epochs 1` smoke run, export 변경은 `export.py`로 확인합니다. ONNX 관련 변경은 완료 처리 전에 PyTorch 출력과 export 출력이 일치하는지 비교합니다. TensorRT runtime, C++ 후처리, 추론 서버 검증은 별도 요청이 있을 때만 다룹니다.
 
 ## 커밋 및 Pull Request 지침
 

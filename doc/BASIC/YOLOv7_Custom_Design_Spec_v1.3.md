@@ -53,7 +53,7 @@
 | 성능 향상 단위 | percentage points 기준 | baseline 대비 delta 기록 |
 | 속도/연산량 | 기존 모델 대비 GFLOPs 증가 10% 미만 | `tools/profile_model.py` 결과 |
 | 검증 데이터 | 동일 validation set 고정 | dataset path, image count, label count, checksum 기록 |
-| Export 검증 | PyTorch/ONNX/TensorRT output 비교 | `tools/verify_export.py` 결과 |
+| Export 검증 | PyTorch/ONNX Runtime output 비교 | `tools/verify_export.py` 결과 |
 
 ## 2. 학습 코드 통합 설계
 
@@ -181,7 +181,7 @@ W6 1280×736 기준 stride=4 P2 feature를 소형 객체 검출에 사용한다.
 
 FCOS P2는 후순위로 두고, 먼저 P2 Anchor Head로 성능/속도 균형을 확인한다.
 
-P2 추가 후 total_boxes 증가에 따른 C++ NMS 속도도 함께 측정한다.
+P2 추가 후 total_boxes 증가량과 Python 기준 NMS 비용 추정치를 함께 측정한다. C++ NMS는 별도 요청 전까지 구현 범위에서 제외한다.
 
 ### 3.3 AUX Head 설계 (L / W6 공통)
 
@@ -639,52 +639,21 @@ ONNX/TensorRT 입력 해상도는 TensorRT 및 YOLO stride 호환을 위해 32 �
 
 ### 8.2 NMS 모드 설계 — raw output 기본
 
-운영 안정성 기준으로 raw output을 기본값으로 한다. EfficientNMS 내장은 옵션으로 제공한다.
+현재 개발 범위에서는 raw ONNX output을 기본값으로 한다. C++ 후처리, TensorRT runtime, EfficientNMS 내장은 별도 요청 전까지 구현하지 않는다.
 
-| NMS 모드 | 방식 | 장점 | 단점 | 기본값 |
-| --- | --- | --- | --- | --- |
-| none (raw) | C++ 외부 NMS | TRT 버전 무관 / threshold 런타임 조정 / 디버깅 용이 | 후처리 별도 구현 | ✅ 기본 |
-| efficient_nms | TRT Plugin 내장 | end-to-end 단순 | TRT 버전별 API 다름 / threshold 고정 | 옵션 |
+| NMS 모드 | 방식 | 상태 | 비고 |
+| --- | --- | --- | --- |
+| none (raw) | ONNX raw output | ✅ 기본 | Python 검증 도구에서 output shape/value 비교 |
+| efficient_nms | TRT Plugin 내장 | 제외 | TensorRT runtime 차수에서 별도 검토 |
 
-C++ 후처리 구조 (raw output 기본):
+### 8.3 ONNX Runtime 검증 환경
 
-// TRT inference → raw output
-
-// output: [batch, total_boxes, 5+C]
-
-//   total_boxes = anchor_boxes + free_boxes
-
-// C++ NMS 후처리 (런타임 threshold 자유 조정)
-
-vector<Detection> postprocess(
-
-float* output, int total_boxes,
-
-float conf_thres, float iou_thres, int num_classes
-
-);
-
-### 8.3 TRT 버전별 EfficientNMS 분기 (옵션 모드)
-
-| 항목 | TRT 8.6 | TRT 10.x |
-| --- | --- | --- |
-| Plugin API | IPluginV2Creator | IPluginV3Creator |
-| 버전 감지 | trt.__version__ 자동 판별 | 동일 |
-| 빌드 스크립트 | build_trt.py 내부 분기 | 동일 스크립트 |
-| 정밀도 | FP16 기본 | FP16 기본 |
-
-`--trt-version` 옵션은 자동 감지 실패 시 사용하는 override로 정의한다. 기본 동작은 설치된 TensorRT의 `trt.__version__` 자동 감지다.
-
-#### 8.3.1 검증 환경 매트릭스
-
-| 항목 | TensorRT 8.6 검증 | TensorRT 10.x 검증 |
-| --- | --- | --- |
-| OS | Windows | Windows |
-| GPU | RTX A6000 48GB | RTX A6000 48GB |
-| CUDA/cuDNN | 프로젝트 환경에서 고정 후 기록 | 프로젝트 환경에서 고정 후 기록 |
-| PyTorch/ONNX Runtime | `requirements.txt`와 export 환경 기록 | `requirements.txt`와 export 환경 기록 |
-| Visual Studio | 2019/2022 중 실제 빌드 버전 기록 | 2019/2022 중 실제 빌드 버전 기록 |
-| Smoke test | ONNX load → TRT FP16 build → 1 image inference | ONNX load → TRT FP16 build → 1 image inference |
+| 항목 | 기준 |
+| --- | --- |
+| OS | Windows |
+| GPU | RTX A6000 48GB |
+| PyTorch/ONNX Runtime | `requirements.txt`와 export 환경 기록 |
+| Smoke test | PyTorch forward → ONNX Runtime forward → output diff 비교 |
 
 ### 8.4 Dynamic Shape Profile
 
@@ -699,17 +668,7 @@ float conf_thres, float iou_thres, int num_classes
 
 python export.py --weights best.pt --img 640 384 --opset 16 --nms-mode none
 
-# TRT raw output 빌드 (기본, 권장)
-
-python build_trt.py --onnx best.onnx --trt-version 8.6 --fp16 --nms-mode none --model-type l
-
-# TRT EfficientNMS 빌드 (옵션)
-
-python build_trt.py --onnx best.onnx --trt-version 8.6 --fp16 --nms-mode efficient_nms --model-type l
-
-# TRT 10.x (동일 스크립트, 버전만 변경)
-
-python build_trt.py --onnx best.onnx --trt-version 10 --fp16 --nms-mode none --model-type l
+TensorRT engine build, C++ 후처리, 추론 서버 실행 명령은 현재 개발 범위에서 제외한다.
 
 ## 9. 구현 파일 맵 및 작업 순서
 
@@ -732,10 +691,8 @@ python build_trt.py --onnx best.onnx --trt-version 10 --fp16 --nms-mode none --m
 | data/hyp_phase3.yaml | Phase 3 하이퍼파라미터 | 낮 | 없음 |
 | train.py | train+train_aux 통합, 3단계 자동화, A/B 플래그 | 높 | 전체 |
 | export.py | AUX 비활성 + 두 헤드 정규화 export | 높 | models/ |
-| build_trt.py | TRT 8.6/10.x 분기, NMS 모드 옵션 | 중 | export.py |
 | tools/profile_model.py | params/GFLOPs 측정 및 10% 예산 검증 | 낮 | models/, cfg/ |
-| tools/verify_export.py | PyTorch/ONNX/TensorRT raw output 수치 비교 | 중 | export.py, build_trt.py |
-| deploy/cpp/postprocess.cpp/.h | raw output decode + C++ NMS 후처리 | 중 | TRT runtime |
+| tools/verify_export.py | PyTorch/ONNX Runtime raw output 수치 비교 | 중 | export.py |
 | tools/check_aug_visual.py | Augmentation 결과/라벨 오염 시각 검증 | 낮 | augmentations.py |
 
 ### 9.2 A/B 실험 플래그 (train.py)
@@ -775,7 +732,7 @@ L 모델은 실험 A와 C까지 진행한다. W6는 A/B/D/E/F를 진행하되, D
 | 실험 | 성공 기준 | 중단 기준 |
 | --- | --- | --- |
 | A | baseline 대비 primary mAP 상승, GFLOPs +10% 미만 | NaN/Inf 또는 mAP 2 points 이상 하락 |
-| B | W6 소형 객체 AP/recall 상승, GFLOPs +10% 미만 | C++ NMS 포함 latency 예산 초과 |
+| B | W6 소형 객체 AP/recall 상승, GFLOPs +10% 미만 | output box 수 또는 Python NMS 비용 과다 |
 | C | L 희귀 클래스 recall 상승 | L GFLOPs +10% 초과 또는 효과 미미 |
 | D | PSA P5 단독에서 mAP 상승 | TRT FP16 profile 편차 증가 |
 | E | P2 Anchor 대비 소형 객체 recall 추가 상승 | postprocess 복잡도 또는 latency 과다 |
@@ -788,14 +745,14 @@ L 모델은 실험 A와 C까지 진행한다. W6는 A/B/D/E/F를 진행하되, D
 | 단계 | 우선순위 | 변경 범위 | 검증/산출물 | 다음 단계 진입 조건 |
 | --- | --- | --- | --- | --- |
 | 0. Baseline 고정 | 최우선 | 원본 YOLOv7-L/W6 학습, 평가, export 재현 | baseline `best.pt`, `results.csv`, GFLOPs, TRT FP16 latency | L/W6 baseline 수치와 validation set checksum 확보 |
-| 1. Export/후처리 기준선 | 최우선 | raw ONNX export, TensorRT FP16 build, C++ NMS 연결 | `tools/verify_export.py`, PyTorch/ONNX/TRT output 비교 | export 오차 허용 범위 통과 |
+| 1. Export 기준선 | 최우선 | raw ONNX export, PyTorch/ONNX Runtime 비교 | `tools/verify_export.py`, PyTorch/ONNX output 비교 | export 오차 허용 범위 통과 |
 | 2. 학습 루프 통합 | 높음 | `train.py` 통합, Phase 1/2/3, rect finetune, DataLoader rebuild | `phase_transition.log`, epoch boundary test, `workers=0/>0` smoke test | Phase 전환과 Close Mosaic 정상 동작 |
 | 3. 계측/로그 기반 | 높음 | `results.csv` canonical log, `tools/profile_model.py`, per-class 주기 저장 | mAP/GFLOPs/latency 비교표 | GFLOPs delta 자동 계산 가능 |
 | 4. 데이터/Aug 기반 | 중간 | CCTV pixel aug, Patch-Paste 안전장치, Hard Negative, Weighted Sampler | `tools/check_aug_visual.py` 샘플, 라벨 오염 점검 | 시각 검증 통과, 학습 smoke run 정상 |
 | 5A. Head 구조 | 중간 | Decoupled Head만 적용 | 실험 A-1 결과, export 비교 | GFLOPs +10% 미만, mAP 하락 없음 |
 | 5B. Box Loss | 중간 | WIoU v3만 적용, CIoU fallback 유지 | loss 안정성, resume state 확인 | NaN/Inf 없음, mAP 하락 없음 |
 | 5C. Assignment/Cls Loss | 중간 | TAL + VFL 적용, SimOTA/BCE fallback 유지 | positive 수, loss scale, mAP 비교 | baseline 대비 primary metric 개선 |
-| 6. W6 구조 확장 | 중간 | W6 P2 Anchor + SCDown | W6 소형 객체 AP/recall, NMS latency, GFLOPs | GFLOPs +10% 미만, C++ NMS 속도 허용 |
+| 6. W6 구조 확장 | 중간 | W6 P2 Anchor + SCDown | W6 소형 객체 AP/recall, output box 수, GFLOPs | GFLOPs +10% 미만, output 증가 허용 |
 | 7. L 옵션 검증 | 낮음 | L AUX on 성능형 옵션만 별도 실험 | L recall/mAP, export 영향 확인 | 효과 없거나 불안정하면 off 유지 |
 | 8. 후순위 구조 | 낮음 | PSA P5 → FCOS P2 → GELAN 순차 단독 실험 | 각 실험별 mAP/GFLOPs/export 결과 | 앞 단계 목표 미달이고 latency 여유가 있을 때만 진행 |
 | 9. 파인튜닝 | 별도 | Replay Buffer, Pseudo Label, YOLO LwF A/B | 기존/대상 클래스 mAP, forgetting 지표 | scratch 학습 기준선 확정 후 진행 |
@@ -819,7 +776,7 @@ L 모델은 실험 A와 C까지 진행한다. W6는 A/B/D/E/F를 진행하되, D
 | Stage | 목적 | 활성 플래그 예시 | 성공 조건 |
 | --- | --- | --- | --- |
 | 0 | baseline 고정 | baseline 기본값 | 학습/평가/export 기준값 확보 |
-| 1 | export 기준선 | `--nms-mode none` | PyTorch/ONNX/TRT 비교 통과 |
+| 1 | export 기준선 | `--nms-mode none` | PyTorch/ONNX 비교 통과 |
 | 2 | 통합 학습 루프 | `--phase-train on` | Phase/DataLoader 전환 테스트 통과 |
 | 3 | 계측/로그 | `--profile on --log-format csv` | GFLOPs/latency/results.csv 생성 |
 | 4A | Head만 변경 | `--head decoupled` | GFLOPs +10% 미만, mAP 하락 없음 |
@@ -839,7 +796,7 @@ L 모델은 실험 A와 C까지 진행한다. W6는 A/B/D/E/F를 진행하되, D
 
 - primary mAP가 baseline 대비 2 percentage points 이상 하락
 - GFLOPs 증가율이 10% 이상
-- TensorRT export 또는 output 비교 실패
+- ONNX export 또는 PyTorch/ONNX output 비교 실패
 - NaN/Inf loss 발생
 - Close Mosaic/DataLoader rebuild 테스트 실패
 - label-changing aug 시각 검증 실패
@@ -907,12 +864,12 @@ GFLOPs는 `tools/profile_model.py`로 측정한다. L은 `640×384`, W6는 `1280
 | Logging | results.csv / per_class.csv / loss_detail.csv | ✅ 확정 |  |
 | Logging | Phase 전환 알림 / 로그 | ✅ 확정 |  |
 | Logging | 학습 곡선 / PR / F1 / 혼동행렬 PNG | ✅ 확정 |  |
-| Export | raw output 기본 (C++ NMS 외부 처리) | ✅ 확정 | 구조 변경마다 중간 검증 필수 |
-| Export | EfficientNMS 옵션 (--nms-mode efficient_nms) | ✅ 확정 | 옵션화 |
+| Export | raw ONNX output 기본 | ✅ 확정 | 구조 변경마다 PyTorch/ONNX 중간 검증 필수 |
+| Export | EfficientNMS 옵션 (--nms-mode efficient_nms) | 제외 | TensorRT runtime 차수에서 별도 검토 |
 | Export | ONNX opset=16 | ✅ 확정 |  |
-| Export | TRT 버전 자동 감지 / 분기 빌드 | ✅ 확정 |  |
-| Export | L / W6 Dynamic Profile 분리 | ✅ 확정 |  |
-| Export | FP16 기본 | ✅ 확정 |  |
+| Export | TRT 버전 자동 감지 / 분기 빌드 | 제외 | 별도 요청 전까지 제외 |
+| Export | L / W6 Dynamic Profile 분리 | ⚠ 후순위 | ONNX 입력 shape 기준만 유지 |
+| Export | FP16 기본 | 제외 | TensorRT runtime 차수에서 검토 |
 | 제외 | PGI (성능 검증 실패) | ❌ 제외 |  |
 | 제외 | SAHI (속도 조건 위반) | ❌ 제외 |  |
 | 제외 | FlashAttention (GPU 행렬 한계) | ❌ 제외 |  |
@@ -1159,7 +1116,7 @@ python finetune.py \
 
 ### 12.1 확정 방향
 
-공통 확정: Decoupled Head, WIoU v3, TAL + VFL, CCTV Aug 조정, Hard Negative, Rect Finetune, raw output export, C++ NMS.
+공통 확정: Decoupled Head, WIoU v3, TAL + VFL, CCTV Aug 조정, Hard Negative, Rect Finetune, raw ONNX output export.
 
 YOLOv7-L 확정: 경량형 모델로 운용한다. AUX off, P2 off, Neck 원본 유지, Decoupled Head + WIoU + TAL/VFL만 적용한다.
 
@@ -1175,7 +1132,7 @@ GELAN은 최후순위 실험으로 유지한다. 채널/route/concat 안정성 �
 
 ### 12.3 구현 기준
 
-구조 변경 후에는 즉시 raw output ONNX export, TensorRT FP16 build, PyTorch/ONNX/TRT 출력 비교를 수행한다.
+구조 변경 후에는 즉시 raw output ONNX export와 PyTorch/ONNX Runtime 출력 비교를 수행한다.
 
 L은 속도 유지가 핵심이고 W6는 소형 객체 성능 개선이 핵심이다. 모델별 역할을 혼동하지 않는다.
 
@@ -1197,7 +1154,7 @@ L은 속도 유지가 핵심이고 W6는 소형 객체 성능 개선이 핵심�
 | PSA | 2차 후보 | attention 계열로 latency/profile 편차 가능 | W6 P5 단독부터 검증 |
 | FCOS P2 | 후순위 | anchor head와 score/loss/postprocess 결합 복잡도 높음 | P2 Anchor 부족 시만 검토 |
 | GELAN | 최후순위 | YOLOv9 PGI/GELAN 전체 맥락과 분리 적용 시 효과 보장 어려움 | 채널/route 검증 후 단독 실험 |
-| raw output + C++ NMS | 확정 | TRT 버전 차이, threshold 변경, ROI/class filtering 운영성 확보 | --nms-mode none 기본 |
+| raw ONNX output | 확정 | 후처리 구현과 모델 export 검증을 분리하기 위함 | --nms-mode none 기본 |
 | Replay Buffer + YOLO LwF | Replay 확정 / LwF A-B | continual learning에서 기존 클래스 망각 억제 목적과 부합 | replay-ratio 0.3 기본, LwF는 성능 비교 |
 
 ### 13.2 논문별 반영 기준
@@ -1225,7 +1182,7 @@ YOLOv7-L 최종 착수 기준
 
 • 학습: WIoU v3 + TAL + VFL 확정, CIoU/BCE/SimOTA fallback 유지
 
-• 운영: raw output export + C++ NMS 후처리
+• 운영: raw ONNX output export. C++/TensorRT 추론은 별도 차수에서 검토
 
 YOLOv7-W6 최종 착수 기준
 
@@ -1237,7 +1194,7 @@ YOLOv7-W6 최종 착수 기준
 
 • 후순위: PSA P5, FCOS P2, GELAN
 
-• 운영: raw output export + C++ NMS 후처리
+• 운영: raw ONNX output export. C++/TensorRT 추론은 별도 차수에서 검토
 
 ### 13.4 후순위 항목 적용 조건
 
@@ -1253,7 +1210,7 @@ YOLOv7-W6 최종 착수 기준
 1. Baseline L/W6 학습 결과와 v1.3 최종안 결과를 반드시 동일 validation set에서 비교한다.
 2. `tools/profile_model.py`로 L/W6 GFLOPs delta가 10% 미만인지 확인한다.
 3. Phase 전환 unit test와 DataLoader rebuild smoke test를 통과해야 한다.
-4. 구조 변경 직후 `tools/verify_export.py`로 PyTorch/ONNX/TensorRT raw output을 비교한다.
+4. 구조 변경 직후 `tools/verify_export.py`로 PyTorch/ONNX Runtime raw output을 비교한다.
 5. W6 P2 Anchor/SCDown 적용 후 latency 또는 GFLOPs가 목표 범위를 벗어나면 PSA/FCOS/GELAN 실험을 보류한다.
 6. L 모델은 구조 경량 유지 원칙을 깨지 않는다. L의 성능 개선은 WIoU/TAL/VFL, Aug, Hard Negative 중심으로 처리한다.
 7. 파인튜닝은 Replay Buffer를 먼저 적용하고, LwF는 forgetting이 남을 때 A/B로 활성화한다.
