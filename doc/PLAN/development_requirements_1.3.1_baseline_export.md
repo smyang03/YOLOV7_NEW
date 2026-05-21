@@ -1,5 +1,108 @@
 # 1.3.1 Code-Level Development Requirements
 
+## 1.3.1.1 코드 구현 상세
+
+이 세부 항목은 현재 코드 기준으로 `1.3.1-P1/P2`를 실제 구현할 때 먼저 적용할 함수, argparse, YAML 저장, checkpoint 경로를 고정한다.
+
+### 대상 파일과 함수
+
+| 파일 | 함수/위치 | 구현 방식 |
+| --- | --- | --- |
+| `utils/datasets.py` | `img2label_paths(img_paths)` | 일반 YOLO layout인 `.../images/...` -> `.../labels/...` 변환을 기본으로 복구한다. `JPEGImages` -> `labels`는 보조 fallback으로만 유지한다. |
+| `utils/datasets.py` | `create_dataloader(...)` | `persistent_workers`는 `nw > 0`일 때만 `True`가 될 수 있다. `close_mosaic=True`면 phase 전환 안정성을 위해 `persistent_workers=False`를 기본으로 둔다. |
+| `utils/datasets.py` | `LoadImagesAndLabels.__init__` cache load block | 기존 `.cache`가 있어도 `hash`, `version`을 확인한다. 불일치, 누락, load 실패 시 `cache_labels()`로 재생성한다. |
+| `train.py`, `train_aux.py` | argparse block | `--img`는 `--img-size`의 alias, `--batch`는 `--batch-size`의 alias로 추가하고 `dest`는 기존 변수명 `img_size`, `batch_size`를 유지한다. |
+| `test.py` | argparse block | `--img` alias를 `--img-size`와 같은 `dest='img_size'`로 추가한다. `--batch` alias도 동일하게 처리한다. |
+| `export.py` | argparse block | `--img` alias, `--batch` alias, `--opset`, `--nms-mode {none,end2end}`를 추가한다. 기본은 raw output인 `--nms-mode none`이다. |
+| `train.py`, `train_aux.py` | opt 저장 | `yaml.dump(vars(opt))` 전에 `Path` 타입은 문자열로 변환한다. `save_dir`은 반드시 YAML SafeLoader로 다시 읽을 수 있어야 한다. |
+| `train.py`, `train_aux.py` | checkpoint save branch | `opt.model_saveoptimizer`가 꺼져 있어도 best 갱신 시 `weights/best.pt`를 반드시 저장한다. |
+| `train.py`, `train_aux.py` | final COCO eval | `test.test()`가 4개 값을 반환하므로 `results, _, _, _ = test.test(...)` 형태로 맞춘다. |
+| `utils/general.py` | `increment_path` | 중복 정의를 하나로 정리한다. 반환 타입은 호출부와 YAML 저장을 고려해 문자열 또는 호출부 변환을 명시한다. |
+
+### argparse 구현 규칙
+
+기존 option 이름을 깨지 않는다. alias만 추가한다.
+
+```python
+parser.add_argument('--batch-size', '--batch', dest='batch_size', type=int, default=16,
+                    help='total batch size for all GPUs')
+parser.add_argument('--img-size', '--img', dest='img_size', nargs='+', type=int, default=[640, 640],
+                    help='[train, test] image sizes')
+```
+
+`test.py`는 `img_size`가 scalar이므로 아래처럼 유지한다.
+
+```python
+parser.add_argument('--img-size', '--img', dest='img_size', type=int, default=640,
+                    help='inference size (pixels)')
+```
+
+`export.py`는 rectangular 입력을 허용하므로 `nargs='+'`를 유지하고, 길이가 1이면 `[v, v]`로 확장한다.
+
+### YAML safe 저장 규칙
+
+`opt.yaml` 저장 전에 아래 helper를 추가하거나 동등한 변환을 수행한다.
+
+```python
+def sanitize_yaml_value(v):
+    if isinstance(v, Path):
+        return str(v)
+    if isinstance(v, (list, tuple)):
+        return [sanitize_yaml_value(x) for x in v]
+    if isinstance(v, dict):
+        return {k: sanitize_yaml_value(x) for k, x in v.items()}
+    return v
+```
+
+저장 시에는 `yaml.safe_dump(sanitize_yaml_value(vars(opt)), ...)` 사용을 우선한다. resume은 기존처럼 `yaml.load(..., Loader=yaml.SafeLoader)`로 읽어야 한다.
+
+### cache invalidation 구현 규칙
+
+`cache` 로드 후 아래 조건 중 하나라도 만족하면 재생성한다.
+
+- `hash` key 없음
+- `version` key 없음
+- `cache['hash'] != get_hash(self.label_files + self.img_files)`
+- `cache['version'] != 0.1`
+- `torch.load(cache_path)` 실패
+
+cache 재생성 후 `results`, `hash`, `version`이 반드시 있어야 한다.
+
+### checkpoint 구현 규칙
+
+`best_fitness == fi`일 때는 두 저장 branch 모두 아래를 만족해야 한다.
+
+```python
+torch.save(ckpt, wdir / f'best_{epoch:03d}.pt')
+torch.save(ckpt, wdir / 'best.pt')
+```
+
+optimizer stripping branch에서는 `best.pt`도 strip 대상에 포함한다. default branch에서는 optimizer 포함 여부 정책을 유지하되 `best.pt` 누락은 허용하지 않는다.
+
+### 검증 명령
+
+COCO128 quick 확인:
+
+```bash
+python train.py --cfg cfg/training/yolov7.yaml --data data/coco128.yaml --hyp data/hyp.scratch.p5.yaml --epochs 1 --img 640 --batch 4 --workers 0 --name smoke_1311_l
+python train_aux.py --cfg cfg/training/yolov7-w6.yaml --data data/coco128.yaml --hyp data/hyp.scratch.p6.yaml --epochs 1 --img 640 --batch 2 --workers 0 --name smoke_1311_w6
+```
+
+필수 확인:
+- `weights/best.pt` 존재
+- `weights/last.pt` 존재
+- `opt.yaml` SafeLoader load 성공
+- `workers=0`에서 DataLoader 생성 성공
+- cache 삭제 후 생성, cache 유지 후 재사용, label 수정 후 재생성 확인
+
+## 리포트 기반 정비 기준
+
+- 문서 위치 기준: 본 코드레벨 개발 요구서는 `doc/PLAN/`에 둔다.
+- 기준 리포트: `doc/REPORT/ai_perspective_yolov7_improvement_analysis_2026-05-22.md`
+- 현재 구현 시작점은 `1.3.1-P1`이다.
+- 본 차수에서는 모델 성능 개선을 시도하지 않는다. dataset 경로, cache, worker, checkpoint, export 기준선만 안정화한다.
+- `1.3.1-P1`과 `1.3.1-P2`가 끝나기 전에는 loss, head, augmentation, W6 구조 변경을 시작하지 않는다.
+
 - 기준 계획: `doc/PLAN/development_plan_v1.3.md`
 - 대상 차수: `1.3.1 Baseline / Python Export 기준선`
 - 목적: 모델 개선 전 원본 YOLOv7-L/W6의 학습, 평가, Python-side ONNX export 기준선을 고정한다.

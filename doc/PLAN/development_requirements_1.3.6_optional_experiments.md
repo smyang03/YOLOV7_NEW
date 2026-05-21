@@ -1,5 +1,86 @@
 # 1.3.6 Code-Level Development Requirements
 
+## 1.3.6.1 코드 구현 상세
+
+이 세부 항목은 optional 실험이 기본 경로에 섞이지 않도록 flag validation, cfg 분리, decode 검증 도구를 고정한다.
+
+### 대상 파일과 구현 위치
+
+| 파일 | 위치 | 구현 방식 |
+| --- | --- | --- |
+| `train.py` | argparse validation | optional flag가 동시에 둘 이상 켜지면 실패 처리한다. |
+| `models/common.py` | PSA/GELAN 후보 block | 기본 import/parse만 가능하게 하되 실제 사용은 cfg와 flag가 맞을 때만 허용한다. |
+| `models/yolo.py` | FCOS 후보 head | 기본 Detect 경로와 output contract를 섞지 않는다. FCOS는 별도 raw output으로 둔다. |
+| `tools/decode_fcos_outputs.py` | 신규 CLI | FCOS raw output을 Python에서 decode하고 score 결합을 검증한다. |
+| `doc/REPORT/optional_decision_*.md` | 사전 리포트 | optional 진입 사유와 목표 metric 부족분을 기록한다. |
+
+### argparse 구현 규칙
+
+```python
+parser.add_argument('--aux', choices=['auto', 'on', 'off'], default='auto')
+parser.add_argument('--psa-level', choices=['none', 'p5', 'p4p5', 'p3p4p5'], default='none')
+parser.add_argument('--p2-head', choices=['none', 'anchor', 'fcos'], default='none')
+parser.add_argument('--neck-mod', choices=['none', 'scdown', 'psa', 'gelan'], default='none')
+```
+
+optional validation:
+- `--neck-mod psa`이면 `--psa-level p5`만 1차 허용한다.
+- `--p2-head fcos`는 W6에서만 허용한다.
+- `--neck-mod gelan`은 W6 일부 neck cfg에서만 허용한다.
+- PSA, FCOS, GELAN은 동시에 켜지 않는다.
+
+### optional_decision schema
+
+```yaml
+date:
+baseline_stage:
+target_model: "l|w6"
+missing_metric:
+current_value:
+target_value:
+remaining_gflops_budget_percent:
+requested_experiment:
+expected_gain:
+stop_condition:
+```
+
+이 파일이 없으면 optional 실험 실행을 막는다.
+
+### FCOS P2 decode 계약
+
+FCOS P2는 본 차수에서 Python raw/decode까지만 검증한다.
+
+필수 출력:
+- `fcos_decode_check.json`
+- raw output shape
+- decoded box count
+- score 결합 방식
+- anchor output과 NMS input 결합 여부
+
+C++ postprocess, TensorRT plugin, runtime deploy는 이 문서 범위가 아니다.
+
+### 검증 명령
+
+```bash
+python train.py --cfg cfg/training/yolov7.yaml --data data/coco128.yaml --epochs 1 --aux on --name smoke_1361_l_aux
+python train.py --cfg cfg/training/yolov7-w6-p2.yaml --data data/coco128.yaml --epochs 1 --p2-head fcos --name smoke_1361_fcos
+python tools/decode_fcos_outputs.py --weights runs/train/.../weights/best.pt --data data/coco128.yaml
+```
+
+필수 확인:
+- optional decision report 존재
+- optional flag 동시 적용 차단
+- export 실패 시 optional drop
+- 효과 미미 시 기본 off 유지
+
+## 리포트 기반 정비 기준
+
+- 문서 위치 기준: 본 코드레벨 개발 요구서는 `doc/PLAN/`에 둔다.
+- 기준 리포트: `doc/REPORT/ai_perspective_yolov7_improvement_analysis_2026-05-22.md`
+- Optional 실험은 기본 개발 흐름이 아니다.
+- 1.3.1~1.3.5 산출물이 안정화되고 목표 metric이 부족할 때만 시작한다.
+- optional 구조는 동시에 둘 이상 켜지 않으며, 진입 전 `doc/REPORT/optional_decision_*.md`를 먼저 작성한다.
+
 - 기준 계획: `doc/PLAN/development_plan_v1.3.md`
 - 대상 차수: `1.3.6 Optional / 후순위 실험`
 - 선행 조건: `1.3.5`까지 필수 구성이 안정화되었고 개선 목표가 아직 부족한 경우

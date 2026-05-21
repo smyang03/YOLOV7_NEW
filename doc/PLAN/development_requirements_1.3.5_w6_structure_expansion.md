@@ -1,5 +1,89 @@
 # 1.3.5 Code-Level Development Requirements
 
+## 1.3.5.1 코드 구현 상세
+
+이 세부 항목은 현재 `cfg/training/yolov7-w6.yaml`, `models/yolo.py`, `models/common.py` 기준으로 W6 P2 Anchor와 SCDown을 구현할 때 필요한 내부 설계를 고정한다.
+
+### 대상 파일과 구현 위치
+
+| 파일 | 위치 | 구현 방식 |
+| --- | --- | --- |
+| `models/common.py` | 신규 `SCDown` class | `Conv` 기반 downsampling block으로 구현한다. ONNX export 가능한 표준 연산만 사용한다. |
+| `models/yolo.py` | `Model.__init__` stride build | `IAuxDetect` stride 계산은 `self.forward(... )[:m.nl]` 또는 main output 수 기준으로 동작해야 한다. 현재처럼 `[:4]` 하드코딩을 유지하면 P2 포함 5-level에서 실패한다. |
+| `models/yolo.py` | `IAuxDetect.__init__` | `self.nl = len(anchors)` 기준으로 `ch[:self.nl]`, `ch[self.nl:]`를 main/aux로 분리한다. P2 적용 시 main 5개 + aux 5개 입력을 받는다. |
+| `cfg/training/yolov7-w6-scdown.yaml` | 신규 cfg | SCDown only 실험. P2 anchor는 추가하지 않는다. |
+| `cfg/training/yolov7-w6-p2.yaml` | 신규 cfg | P2 Anchor only 실험. SCDown은 적용하지 않는다. |
+| `cfg/training/yolov7-w6-p2-scdown.yaml` | 신규 cfg | P2 + SCDown 누적 실험. |
+| `tools/estimate_nms_cost.py` | 신규 CLI | output box 수, per-level grid, Python NMS ms를 추정한다. |
+
+### SCDown class 설계
+
+`SCDown`은 최소 형태로 시작한다.
+
+```python
+class SCDown(nn.Module):
+    def __init__(self, c1, c2, k=3, s=2):
+        super().__init__()
+        self.cv1 = Conv(c1, c2, 1, 1)
+        self.cv2 = Conv(c2, c2, k, s)
+
+    def forward(self, x):
+        return self.cv2(self.cv1(x))
+```
+
+구현 시 `parse_model()`의 module list에 `SCDown`이 포함되어야 한다. `Conv`와 같은 방식으로 `c1`, `c2` channel 계산이 가능해야 한다.
+
+### P2 Anchor cfg 규칙
+
+W6 P2는 5-level detection이다.
+
+```yaml
+anchors:
+  - [...]  # P2/4
+  - [...]  # P3/8
+  - [...]  # P4/16
+  - [...]  # P5/32
+  - [...]  # P6/64
+```
+
+마지막 `IAuxDetect` 입력은 main 5개 + aux 5개 총 10개 feature index를 받아야 한다. 기존 W6의 P3/P4/P5/P6 4-level 구조를 보존하고 P2만 추가한다.
+
+### argparse 구현 규칙
+
+```python
+parser.add_argument('--p2-head', choices=['none', 'anchor'], default='none')
+parser.add_argument('--neck-mod', choices=['none', 'scdown'], default='none')
+```
+
+validation 규칙:
+- L 모델 cfg에서 `--p2-head anchor` 또는 `--neck-mod scdown`이면 실패 처리한다.
+- `--p2-head anchor`를 켰는데 cfg 파일명이 `p2` 계열이 아니면 warning 또는 실패 처리한다.
+- `--neck-mod scdown`을 켰는데 cfg가 scdown 계열이 아니면 warning 또는 실패 처리한다.
+
+### 검증 명령
+
+```bash
+python models/yolo.py --cfg cfg/training/yolov7-w6-scdown.yaml
+python models/yolo.py --cfg cfg/training/yolov7-w6-p2.yaml
+python models/yolo.py --cfg cfg/training/yolov7-w6-p2-scdown.yaml
+python tools/estimate_nms_cost.py --cfg cfg/training/yolov7-w6-p2.yaml --img 1280 736
+```
+
+필수 확인:
+- stride가 `[4, 8, 16, 32, 64]`
+- anchors shape가 `[5, na, 2]`
+- IAuxDetect main/aux feature 수가 각각 5
+- raw ONNX export 통과
+- GFLOPs 증가율 10% 미만
+
+## 리포트 기반 정비 기준
+
+- 문서 위치 기준: 본 코드레벨 개발 요구서는 `doc/PLAN/`에 둔다.
+- 기준 리포트: `doc/REPORT/ai_perspective_yolov7_improvement_analysis_2026-05-22.md`
+- 본 차수는 YOLOv7-W6 전용이다. YOLOv7-L 구조는 변경하지 않는다.
+- SCDown only, P2 Anchor only, P2 Anchor + SCDown을 분리해 검증한다.
+- P2 적용 후 output box 수, memory, Python NMS 비용을 반드시 기록한다.
+
 - 기준 계획: `doc/PLAN/development_plan_v1.3.md`
 - 대상 차수: `1.3.5 W6 구조 확장`
 - 선행 조건: `1.3.4` augmentation/sampler 검증 통과

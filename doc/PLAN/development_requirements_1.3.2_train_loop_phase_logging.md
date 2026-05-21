@@ -1,5 +1,110 @@
 # 1.3.2 Code-Level Development Requirements
 
+## 1.3.2.1 코드 구현 상세
+
+이 세부 항목은 `train.py`와 `train_aux.py`를 바로 합치기 전에 공통 helper, phase 계산, logger, dataloader rebuild의 내부 구조를 고정한다.
+
+### 신규 모듈 설계
+
+| 파일 | 클래스/함수 | 역할 |
+| --- | --- | --- |
+| `utils/phase.py` | `PhaseConfig` | phase epoch 길이, phase별 image size, rect/mosaic/hyp 경로를 보관한다. |
+| `utils/phase.py` | `PhaseState` | 현재 epoch의 phase 이름, phase index, rebuild 필요 여부, loss weight를 보관한다. |
+| `utils/phase.py` | `resolve_phase(epoch, config)` | 0-based epoch를 받아 `phase1`, `phase2`, `phase3` 중 하나를 반환한다. end-exclusive 기준이다. |
+| `utils/train_logger.py` | `TrainLogger` | `results.csv`, `loss_detail.csv`, `results_per_class.csv`, `phase_transition.log`, `stage_result.yaml`을 쓴다. |
+| `utils/train_common.py` | `build_train_dataloader()` | `create_dataloader()` 호출을 감싸 phase별 `rect`, `mosaic`, `imgsz`, `workers` 정책을 고정한다. |
+| `utils/train_common.py` | `save_checkpoint()` | `train.py`와 `train_aux.py`의 checkpoint 저장 branch를 통합한다. |
+| `utils/train_common.py` | `run_validation()` | `test.test()` 4-return을 공통 처리한다. |
+| `utils/early_stopping.py` | `PhaseEarlyStopping` | Phase 3에서만 patience를 계산한다. |
+
+### PhaseConfig 예시
+
+```python
+@dataclass
+class PhaseConfig:
+    phase1_epochs: int = 290
+    phase2_epochs: int = 70
+    phase3_epochs: int = 40
+    phase2_img: tuple[int, int] = (640, 384)
+    phase3_img: tuple[int, int] = (640, 384)
+    phase2_rect: bool = True
+    phase2_mosaic: bool = True
+    phase3_mosaic: bool = False
+```
+
+`resolve_phase()`는 아래 boundary를 반드시 통과해야 한다.
+
+| epoch | expected |
+| ---: | --- |
+| 0 | phase1 |
+| 289 | phase1 |
+| 290 | phase2 |
+| 359 | phase2 |
+| 360 | phase3 |
+
+### argparse 구현 규칙
+
+`train.py`와 `train_aux.py`에 같은 option을 추가한다.
+
+```python
+parser.add_argument('--phase-train', choices=['off', 'on'], default='off')
+parser.add_argument('--phase1-epochs', type=int, default=290)
+parser.add_argument('--phase2-epochs', type=int, default=70)
+parser.add_argument('--phase3-epochs', type=int, default=40)
+parser.add_argument('--phase2-img', nargs=2, type=int, default=None)
+parser.add_argument('--phase3-img', nargs=2, type=int, default=None)
+parser.add_argument('--grad-accumulate', type=int, default=None)
+parser.add_argument('--early-stop-phase', choices=['phase3', 'off'], default='phase3')
+parser.add_argument('--per-class-log-interval', type=int, default=10)
+parser.add_argument('--log-format', choices=['txt', 'csv', 'both'], default='both')
+```
+
+### DataLoader rebuild 규칙
+
+Phase 2 또는 Phase 3 최초 진입 시 아래 순서로 처리한다.
+
+1. 기존 `dataloader` reference 제거
+2. 기존 `dataset` reference 제거
+3. CUDA cache 정리
+4. phase별 `imgsz`, `rect`, `mosaic` 정책 계산
+5. `create_dataloader(..., close_mosaic=(phase == 'phase3'))` 호출
+6. `phase_transition.log`에 rebuild 결과 기록
+
+부모 dataset의 `dataset.mosaic = False`만 바꾸는 방식은 허용하지 않는다. `persistent_workers`는 `workers=0` 또는 close mosaic 구간에서 꺼야 한다.
+
+### logger schema
+
+`results.csv` 최소 컬럼:
+
+```text
+epoch,phase,lr,train/box_loss,train/cls_loss,train/obj_loss,
+train/aux_loss,train/total_loss,metrics/precision,metrics/recall,
+metrics/mAP_0.5,metrics/mAP_0.5:0.95,val/box_loss,val/cls_loss,val/obj_loss
+```
+
+`loss_detail.csv`에는 loss component와 positive count를 넣을 수 있도록 확장 가능하게 작성한다.
+
+### 검증 명령
+
+```bash
+python tools/check_phase_schedule.py --phase1-epochs 1 --phase2-epochs 1 --phase3-epochs 1
+python train.py --cfg cfg/training/yolov7.yaml --data data/coco128.yaml --hyp data/hyp.scratch.p5.yaml --epochs 3 --phase-train on --phase1-epochs 1 --phase2-epochs 1 --phase3-epochs 1 --img 640 --batch 4 --workers 0 --name smoke_1321_phase
+```
+
+필수 확인:
+- Phase 2/3 진입 시 rebuild log 존재
+- Phase 3에서 mosaic off
+- `workers=0`과 `workers=2` 둘 다 crash 없음
+- `results.csv`, `loss_detail.csv`, `phase_transition.log` 생성
+
+## 리포트 기반 정비 기준
+
+- 문서 위치 기준: 본 코드레벨 개발 요구서는 `doc/PLAN/`에 둔다.
+- 기준 리포트: `doc/REPORT/ai_perspective_yolov7_improvement_analysis_2026-05-22.md`
+- 본 차수는 모델 구조를 바꾸지 않고 phase, logging, DataLoader rebuild만 안정화한다.
+- Close Mosaic은 부모 dataset 속성 변경만으로 처리하지 않는다. Dataset/DataLoader/worker 재생성을 검증 기준으로 둔다.
+- `1.3.1` export 기준선이 계속 통과해야 다음 PR로 넘어간다.
+
 - 기준 계획: `doc/PLAN/development_plan_v1.3.md`
 - 대상 차수: `1.3.2 Train Loop / Phase / Logging 기반`
 - 선행 조건: `1.3.1` baseline 학습, 평가, ONNX export, `profile.json`, `export_check.json` 완료

@@ -1,5 +1,80 @@
 # 1.3.4 Code-Level Development Requirements
 
+## 1.3.4.1 코드 구현 상세
+
+이 세부 항목은 현재 augmentation이 `utils/datasets.py` 안에 집중되어 있는 구조를 고려해 policy, pixel augmentation, label-changing augmentation, sampler를 분리하는 구현 기준을 고정한다.
+
+### 대상 파일과 함수
+
+| 파일 | 클래스/함수 | 구현 방식 |
+| --- | --- | --- |
+| `utils/datasets.py` | `LoadImagesAndLabels.__getitem__` | 기존 mosaic, mixup, random_perspective 흐름은 유지하고 `AugmentPolicy` 호출 지점을 명확히 삽입한다. |
+| `utils/datasets.py` | `augment_hsv`, `copy_paste`, `load_mosaic`, `load_mosaic9` | 기존 함수는 regression 방지를 위해 그대로 두고, CCTV 전용 aug는 신규 모듈에서 호출한다. |
+| `utils/cctv_augmentations.py` | pixel aug 함수들 | `spider_web`, `to_gray3`, `clahe`, `motion_blur`, `compression_noise`를 label-preserving 함수로 구현한다. |
+| `utils/augment_policy.py` | `AugmentPolicy` | `off`, `cctv_pixel`, `cctv_paste` profile과 phase별 확률을 관리한다. |
+| `utils/sampler.py` | `build_weighted_sampler()` | class/image weight를 계산하고 DDP 미지원 시 명확히 실패 또는 warning 처리한다. |
+| `tools/check_aug_visual.py` | CLI | aug sample을 저장하고 bbox overlay를 그린다. |
+| `tools/check_labels.py` | CLI | bbox range, class id, empty label, tiny box 비율을 검사한다. |
+
+### argparse 구현 규칙
+
+```python
+parser.add_argument('--aug-profile', choices=['off', 'cctv_pixel', 'cctv_paste'], default='off')
+parser.add_argument('--sampler-mode', choices=['off', 'weighted'], default='off')
+parser.add_argument('--aug-debug-samples', type=int, default=0)
+parser.add_argument('--hard-negative-manifest', type=str, default='')
+```
+
+### AugmentPolicy schema
+
+```python
+@dataclass
+class AugmentPolicy:
+    profile: str
+    phase: str
+    spider_web_p: float = 0.0
+    gray_p: float = 0.0
+    clahe_p: float = 0.0
+    blur_p: float = 0.0
+    patch_paste_p: float = 0.0
+    hard_negative_p: float = 0.0
+```
+
+`profile='off'`일 때는 기존 YOLOv7 augmentation만 동작해야 한다. CCTV aug 함수는 image dtype, shape, label count를 바꾸지 않아야 한다. label-changing aug는 반드시 label validator를 통과해야 한다.
+
+### sampler 구현 규칙
+
+기존 `utils/general.py::labels_to_image_weights()`를 재사용하되, 새 sampler는 아래를 기록한다.
+
+- class별 image count
+- class별 sampling weight
+- image별 final weight
+- epoch별 sample histogram
+
+DDP에서는 distributed-aware sampler가 준비되기 전까지 `--sampler-mode weighted`를 단일 GPU 전용으로 제한한다.
+
+### 검증 명령
+
+```bash
+python tools/check_aug_visual.py --data data/coco128.yaml --aug-profile cctv_pixel --samples 200 --output runs/aug_check/cctv_pixel
+python tools/check_labels.py --data data/coco128.yaml
+python train.py --data data/coco128.yaml --epochs 1 --aug-profile cctv_pixel --sampler-mode off --name smoke_1341_aug
+```
+
+필수 확인:
+- visual sample 200장 저장
+- bbox 좌표가 `[0, 1]` 범위 유지
+- class id가 `0 <= cls < nc`
+- label-changing aug는 full training 전 반드시 별도 audit 완료
+
+## 리포트 기반 정비 기준
+
+- 문서 위치 기준: 본 코드레벨 개발 요구서는 `doc/PLAN/`에 둔다.
+- 기준 리포트: `doc/REPORT/ai_perspective_yolov7_improvement_analysis_2026-05-22.md`
+- augmentation 효과는 모델 구조 효과와 분리해 검증한다.
+- label-changing augmentation은 visual audit과 bbox/class id 검사를 통과하기 전 full training에 사용하지 않는다.
+- sampler는 augmentation 검증 후 별도 PR/run으로 적용한다.
+
 - 기준 계획: `doc/PLAN/development_plan_v1.3.md`
 - 대상 차수: `1.3.4 CCTV Augmentation / Sampler`
 - 선행 조건: `1.3.3` core model/loss 단계 통과

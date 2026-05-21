@@ -1,5 +1,78 @@
 # 1.3.3 Code-Level Development Requirements
 
+## 1.3.3.1 코드 구현 상세
+
+이 세부 항목은 기존 `utils/loss.py`, `utils/loss_aux.py`, `models/yolo.py` 구조를 유지하면서 head/loss/assignment를 플래그 기반으로 추가하는 내부 설계를 고정한다.
+
+### 대상 파일과 클래스
+
+| 파일 | 클래스/함수 | 구현 방식 |
+| --- | --- | --- |
+| `models/yolo.py` | `Detect`, `IDetect`, `IAuxDetect` | 기존 output contract를 유지한다. Decoupled Head는 새 class로 추가하거나 기존 head 내부 branch로 추가하되 raw output shape는 동일해야 한다. |
+| `models/yolo.py` | `Model.__init__` stride build | `IAuxDetect`는 현재 `self.forward(... )[:4]` 형태가 있으므로 향후 5-level 대응 시 `m.nl` 기준으로 slicing해야 한다. |
+| `utils/loss.py` | `ComputeLoss`, `ComputeLossOTA`, `ComputeLossAuxOTA` | `--loss-box`, `--assign`, `--loss-cls`에 따라 CIoU/WIoU, SimOTA/TAL, BCE/VFL을 선택한다. |
+| `utils/loss_aux.py` | OTA matching block | `matching_matrix`는 CPU로 강제하지 않는다. `cost.device` 또는 prediction device를 따른다. |
+| `utils/wiou.py` | `WIoUState`, `wiou_loss()` | WIoU running mean과 dynamic focusing을 분리한다. dynamic weight 계산은 `.detach()`를 사용한다. |
+| `utils/tal.py` | `TaskAlignedAssigner` | `topk`, `alpha`, `beta`를 hyp에서 읽고 positive count를 반환한다. |
+| `utils/vfl.py` 또는 `utils/loss_components.py` | `varifocal_loss()` | TAL positive의 IoU-aware target을 사용한다. TAL 없이 VFL을 호출하면 실패 처리한다. |
+
+### argparse 구현 규칙
+
+`train.py`, `train_aux.py`에 동일하게 추가한다.
+
+```python
+parser.add_argument('--head', choices=['coupled', 'decoupled'], default='coupled')
+parser.add_argument('--loss-box', choices=['ciou', 'wiou_v3'], default='ciou')
+parser.add_argument('--assign', choices=['simota', 'tal'], default='simota')
+parser.add_argument('--loss-cls', choices=['bce', 'vfl'], default='bce')
+```
+
+검증 제약:
+- `--loss-cls vfl`이면 `--assign tal`이 아니면 parser 이후 validation에서 실패 처리한다.
+- `--head decoupled`는 처음에는 실제 cfg가 사용하는 Detect 계열부터 지원한다.
+
+### WIoU state 저장
+
+checkpoint extra field에 아래를 저장한다.
+
+```python
+ckpt['loss_state'] = {
+    'wiou': wiou_state.state_dict() if wiou_state else None,
+    'assign': opt.assign,
+    'loss_box': opt.loss_box,
+    'loss_cls': opt.loss_cls,
+}
+```
+
+resume 시 `loss_state['wiou']`가 있으면 복원하고, 없으면 새로 초기화한다. state 누락은 crash가 아니라 warning이어야 한다.
+
+### loss_detail 확장
+
+`loss_detail.csv`에는 최소 아래 컬럼을 추가한다.
+
+```text
+epoch,phase,box_loss,cls_loss,obj_loss,aux_loss,total_loss,
+positive_count,assigner,loss_box,loss_cls,head
+```
+
+### 검증 순서
+
+1. 기존 `coupled + ciou + simota + bce` 결과가 변하지 않는지 smoke
+2. `--head decoupled` 단독
+3. `--loss-box wiou_v3` 단독
+4. `--assign tal --loss-cls vfl` 단독
+5. 전체 누적
+
+각 단계마다 `export_check.json`과 `profile.json`을 남긴다.
+
+## 리포트 기반 정비 기준
+
+- 문서 위치 기준: 본 코드레벨 개발 요구서는 `doc/PLAN/`에 둔다.
+- 기준 리포트: `doc/REPORT/ai_perspective_yolov7_improvement_analysis_2026-05-22.md`
+- Head, WIoU, TAL/VFL은 동시에 처음 켜지 않는다.
+- 검증 run은 `Decoupled Head 단독 -> WIoU 단독 -> TAL+VFL 단독 -> 누적 적용` 순서로 남긴다.
+- 각 run은 `loss_detail.csv`, positive count, `profile.json`, `export_check.json`을 비교 가능하게 저장한다.
+
 - 기준 계획: `doc/PLAN/development_plan_v1.3.md`
 - 대상 차수: `1.3.3 Core Model / Loss 분리 적용`
 - 선행 조건: `1.3.2` Phase/DataLoader/logging 통과
@@ -157,10 +230,10 @@ PhaseState를 기준으로 아래 값을 적용한다.
 
 1. CLI 플래그와 hyp key 추가
 2. `tools/check_loss_smoke.py` 작성
-3. WIoU 단독 구현과 state 저장/resume 검증
-4. TAL assigner 구현
-5. VFL 구현 및 TAL 연동
-6. Decoupled Head 구현
+3. Decoupled Head 단독 구현과 A1 smoke/export 검증
+4. WIoU 단독 구현과 state 저장/resume 검증
+5. TAL assigner 구현
+6. VFL 구현 및 TAL 연동
 7. Detect/IDetect/IAuxDetect head 타입별 smoke
 8. A1, A2, A3 단독 smoke
 9. 누적 A smoke, profile, export 검증
@@ -179,9 +252,9 @@ PhaseState를 기준으로 아래 값을 적용한다.
 | PR | 범위 | 완료 기준 |
 | --- | --- | --- |
 | `1.3.3-P1` | loss option parser, hyp key, `tools/check_loss_smoke.py` | 기존 CIoU/BCE/SimOTA 결과가 변하지 않음 |
-| `1.3.3-P2` | WIoU v3와 checkpoint/resume state | A2 smoke, resume smoke 통과 |
-| `1.3.3-P3` | TAL assigner와 VFL | A3 smoke, positive count/loss scale 기록 |
-| `1.3.3-P4` | Decoupled Head | A1 smoke, raw ONNX export 통과 |
+| `1.3.3-P2` | Decoupled Head | A1 smoke, raw ONNX export 통과 |
+| `1.3.3-P3` | WIoU v3와 checkpoint/resume state | A2 smoke, resume smoke 통과 |
+| `1.3.3-P4` | TAL assigner와 VFL | A3 smoke, positive count/loss scale 기록 |
 | `1.3.3-P5` | 누적 A 적용 및 fallback | A smoke, profile/export/fallback log 검증 |
 
-`P4`의 Decoupled Head는 `Detect`, `IDetect`, `IAuxDetect` 중 실제 cfg가 쓰는 module부터 구현한다. 사용하지 않는 head 타입까지 한 PR에서 모두 완성하려고 하지 않는다.
+`P2`의 Decoupled Head는 `Detect`, `IDetect`, `IAuxDetect` 중 실제 cfg가 쓰는 module부터 구현한다. 사용하지 않는 head 타입까지 한 PR에서 모두 완성하려고 하지 않는다.

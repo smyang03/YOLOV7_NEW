@@ -1,5 +1,91 @@
 # 1.3.7 Code-Level Development Requirements
 
+## 1.3.7.1 코드 구현 상세
+
+이 세부 항목은 `finetune.py`가 별도 학습 루프를 복제하지 않고 1.3.2 공통 helper를 재사용하도록 구현 구조를 고정한다.
+
+### 대상 파일과 클래스
+
+| 파일 | 클래스/함수 | 구현 방식 |
+| --- | --- | --- |
+| `finetune.py` | CLI entry | class mapping check, pseudo label, replay, distill option을 받아 공통 train helper를 호출한다. |
+| `utils/pseudo_label.py` | `PseudoLabelGenerator` | teacher model inference 결과를 confidence/IoU 기준으로 필터링하고 YOLO txt로 저장한다. |
+| `utils/replay_buffer.py` | `ReplayBufferBuilder` | 기존 dataset에서 class-balanced replay manifest를 만든다. |
+| `utils/continual_loss.py` | `DistillationLoss` | cls distill과 reg distill을 분리한다. |
+| `utils/class_mapping.py` | `validate_class_mapping()` | old/new data yaml의 class name/index mapping을 검증한다. |
+| `data/hyp_finetune.yaml` | YAML | close mosaic, 낮은 LR, replay/distill 기본값을 정의한다. |
+
+### argparse 구현 규칙
+
+```python
+parser.add_argument('--base-weights', type=str, required=True)
+parser.add_argument('--teacher-weights', type=str, default='')
+parser.add_argument('--data', type=str, required=True)
+parser.add_argument('--base-data', type=str, required=True)
+parser.add_argument('--replay-ratio', type=float, default=0.3)
+parser.add_argument('--pseudo-conf', type=float, default=0.5)
+parser.add_argument('--pseudo-iou-dedup', type=float, default=0.8)
+parser.add_argument('--distill-alpha', type=str, default='0.0')
+parser.add_argument('--distill-beta', type=str, default='0.0')
+parser.add_argument('--bn-policy', choices=['train', 'eval'], default='train')
+parser.add_argument('--freeze-policy', choices=['none', 'backbone', 'partial'], default='none')
+```
+
+`--distill-alpha`와 `--distill-beta`는 scalar 또는 `start:end` schedule 문자열을 허용한다. parser 이후 `parse_float_or_schedule()`로 변환한다.
+
+### class mapping 검증
+
+`validate_class_mapping()`은 아래를 검사한다.
+
+- 기존 class name이 새 data yaml에서 동일 index인지
+- index가 바뀐 경우 mapping file이 있는지
+- 신규 class가 기존 class를 덮어쓰지 않는지
+- `nc`와 `names` 길이가 일치하는지
+
+검증 결과는 `class_mapping_check.json`에 저장한다.
+
+### pseudo label 생성 규칙
+
+Teacher inference 결과는 아래 조건을 통과해야 병합한다.
+
+- confidence >= `pseudo_conf`
+- 기존 GT와 IoU > `pseudo_iou_dedup`이면 중복 제거
+- class id가 기존 class 범위 안에 있음
+- box 좌표가 `[0, 1]` 범위 안에 있음
+
+### replay manifest schema
+
+```yaml
+source_data:
+replay_ratio:
+class_counts:
+selected_images:
+  - image:
+    label:
+    classes:
+selection_seed:
+```
+
+### 검증 명령
+
+```bash
+python finetune.py --base-weights runs/train/base/weights/best.pt --teacher-weights runs/train/base/weights/best.pt --base-data data/base.yaml --data data/finetune.yaml --epochs 1 --replay-ratio 0.3 --distill-alpha 0.0 --distill-beta 0.0
+```
+
+필수 확인:
+- Replay only가 먼저 통과
+- distill alpha/beta 0일 때 baseline finetune과 동일 경로
+- teacher는 최종 export graph에 포함되지 않음
+- ONNX export 경로 유지
+
+## 리포트 기반 정비 기준
+
+- 문서 위치 기준: 본 코드레벨 개발 요구서는 `doc/PLAN/`에 둔다.
+- 기준 리포트: `doc/REPORT/ai_perspective_yolov7_improvement_analysis_2026-05-22.md`
+- scratch 학습 기준선과 class mapping이 확정된 뒤 시작한다.
+- Replay only를 먼저 검증하고, forgetting이 남을 때만 LwF를 켠다.
+- Teacher model은 pseudo label/distillation 생성에만 사용하고 최종 추론 구조에 영향을 주지 않는다.
+
 - 기준 계획: `doc/PLAN/development_plan_v1.3.md`
 - 대상 차수: `1.3.7 Fine-tuning / Continual Learning`
 - 선행 조건: scratch 학습 기준선과 선택 구조가 확정됨
