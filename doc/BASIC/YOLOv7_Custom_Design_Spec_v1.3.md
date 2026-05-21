@@ -802,6 +802,50 @@ L 모델은 실험 A와 C까지 진행한다. W6는 A/B/D/E/F를 진행하되, D
 
 단계별 결과는 동일 validation set에서 비교한다. 결과표에는 `stage`, `config`, `weights`, `primary_mAP`, `mAP@0.5`, `small_AP`, `rare_recall`, `GFLOPs_delta`, `TRT_latency`, `export_status`를 기록한다.
 
+### 9.4 플래그 기반 통합 구현 및 단계별 학습 실행 계획
+
+개발 방식은 "전체 코드를 플래그 기반으로 먼저 준비하고, 학습 서버에서는 stage별로 하나씩 기능을 켜서 검증"하는 구조로 한다. 기능을 한 번에 모두 활성화하지 않는다.
+
+#### 9.4.1 구현 원칙
+
+모든 신규 기능은 독립 플래그로 제어한다. 기본값은 baseline과 최대한 동일해야 하며, 플래그를 켜지 않으면 기존 YOLOv7 학습/평가/export 동작이 유지되어야 한다.
+
+핵심 플래그는 `--head`, `--loss-box`, `--loss-cls`, `--assign`, `--aux`, `--p2-head`, `--neck-mod`, `--aug-profile`, `--sampler-mode`, `--nms-mode`로 관리한다.
+
+플래그 조합은 stage config로 저장한다. 학습 서버는 stage config를 순서대로 읽고, 이전 stage가 성공한 경우에만 다음 stage를 실행한다.
+
+#### 9.4.2 학습 서버 실행 순서
+
+| Stage | 목적 | 활성 플래그 예시 | 성공 조건 |
+| --- | --- | --- | --- |
+| 0 | baseline 고정 | baseline 기본값 | 학습/평가/export 기준값 확보 |
+| 1 | export 기준선 | `--nms-mode none` | PyTorch/ONNX/TRT 비교 통과 |
+| 2 | 통합 학습 루프 | `--phase-train on` | Phase/DataLoader 전환 테스트 통과 |
+| 3 | 계측/로그 | `--profile on --log-format csv` | GFLOPs/latency/results.csv 생성 |
+| 4A | Head만 변경 | `--head decoupled` | GFLOPs +10% 미만, mAP 하락 없음 |
+| 4B | Box loss만 변경 | `--loss-box wiou_v3` | NaN/Inf 없음, resume 정상 |
+| 4C | Assignment/cls 변경 | `--assign tal --loss-cls vfl` | primary mAP 개선 |
+| 5A | pixel aug | `--aug-profile cctv_pixel` | 시각 검증 및 smoke run 통과 |
+| 5B | label-changing aug | `--aug-profile cctv_paste --sampler-mode weighted` | 라벨 오염 없음 |
+| 6 | W6 구조 확장 | `--p2-head anchor --neck-mod scdown` | small AP/recall 개선, NMS latency 허용 |
+| 7 | L AUX 옵션 | `--aux on` | 효과 없으면 기본 off 유지 |
+| 8 | 후순위 구조 | `--neck-mod psa/fcos/gelan` | 앞 단계 목표 미달이고 latency 여유 있을 때만 |
+
+#### 9.4.3 자동 중단 및 산출물
+
+각 stage 종료 후 `results.csv`, `stage_result.yaml`, `profile.json`, `export_check.json`, `phase_transition.log`를 저장한다.
+
+다음 조건 중 하나라도 발생하면 다음 stage로 진행하지 않는다.
+
+- primary mAP가 baseline 대비 2 percentage points 이상 하락
+- GFLOPs 증가율이 10% 이상
+- TensorRT export 또는 output 비교 실패
+- NaN/Inf loss 발생
+- Close Mosaic/DataLoader rebuild 테스트 실패
+- label-changing aug 시각 검증 실패
+
+실패한 stage는 플래그를 끄고 직전 성공 stage의 config와 weight를 기준으로 재시작한다.
+
 ## 10. 기대 효과 및 확정 체크리스트
 
 ### 10.1 기대 성능 향상
