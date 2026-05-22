@@ -1,5 +1,13 @@
 # 1.3.6 Code-Level Development Requirements
 
+## 공통 예외 사항 - 원 코드 유지 개발
+
+- 본 차수의 새 기능은 기본값으로 비활성화한다. 플래그를 켜지 않으면 기존 YOLOv7 학습, 평가, export 동작이 유지되어야 한다.
+- 기존 함수/클래스는 버그 수정, 호환성 보강, 공통 helper 호출 연결에 한해서만 직접 수정한다.
+- 신규 기능은 가능한 `utils/*`, `models/*`의 새 helper/class/wrapper로 분리하고, 기존 entrypoint는 기존 CLI와 출력 경로를 유지한다.
+- `train.py`, `train_aux.py`, `test.py`, `export.py`는 기존 옵션명을 삭제하지 않는다. alias를 추가할 때도 기존 `dest`와 결과 파일명을 바꾸지 않는다.
+- `train_aux.py`는 즉시 삭제하거나 대체하지 않는다. 공통 helper를 먼저 만들고 AUX/W6 smoke 검증 후 얇은 wrapper로 축소한다.
+
 ## 1.3.6.1 코드 구현 상세
 
 이 세부 항목은 optional 실험이 기본 경로에 섞이지 않도록 flag validation, cfg 분리, decode 검증 도구를 고정한다.

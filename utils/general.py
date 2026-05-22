@@ -901,18 +901,17 @@ def apply_classifier(x, model, img, im0):
     return x
 
 
-def increment_path(path, exist_ok=True, sep=''):
-    # Increment path, i.e. runs/exp --> runs/exp{sep}0, runs/exp{sep}1 etc.
-    path = Path(path)  # os-agnostic
-    if (path.exists() and exist_ok) or (not path.exists()):
-        return str(path)
-    else:
-        dirs = glob.glob(f"{path}{sep}*")  # similar paths
-        matches = [re.search(rf"%s{sep}(\d+)" % path.stem, d) for d in dirs]
-        i = [int(m.groups()[0]) for m in matches if m]  # indices
-        n = max(i) + 1 if i else 2  # increment number
-        return f"{path}{sep}{n}"  # update path
-    
+def sanitize_yaml_value(v):
+    # Convert Path-like values before YAML SafeLoader reads opt.yaml on resume.
+    if isinstance(v, Path):
+        return str(v)
+    if isinstance(v, (list, tuple)):
+        return [sanitize_yaml_value(x) for x in v]
+    if isinstance(v, dict):
+        return {k: sanitize_yaml_value(x) for k, x in v.items()}
+    return v
+
+
 def increment_path(path, exist_ok=False, sep='', mkdir=False):
     # Increment file or directory path, i.e. runs/exp --> runs/exp{sep}2, runs/exp{sep}3, ... etc.
     path = Path(path)  # os-agnostic
@@ -1034,4 +1033,3 @@ def iou_filter(box1, box2, threshold=0.35):
 
     return score, correct,labelcheck
 
- 

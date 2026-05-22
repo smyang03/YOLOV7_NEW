@@ -1,0 +1,4 @@
+# YOLOv7-W6 deploy 1.3.5 D3: P2 anchor-head + SCDown neck experiment.
+base: yolov7-w6.yaml
+p2_head: anchor
+neck_mod: scdown

@@ -28,10 +28,20 @@ from utils.autoanchor import check_anchors
 from utils.datasets import create_dataloader
 from utils.general import labels_to_class_weights, increment_path, labels_to_image_weights, init_seeds, \
     fitness, strip_optimizer, get_latest_run, check_dataset, check_file, check_git_status, check_img_size, \
-    check_requirements, print_mutation, set_logging, one_cycle, colorstr
+    check_requirements, print_mutation, set_logging, one_cycle, colorstr, sanitize_yaml_value
 from utils.google_utils import attempt_download
+from utils.early_stopping import PhaseEarlyStopping
+from utils.augment_policy import ensure_aug_option_defaults, validate_aug_options
 from utils.loss_aux import ComputeLoss, ComputeLossAuxOTA
+from utils.loss_components import apply_loss_options, build_loss_state, ensure_loss_option_defaults, \
+    get_loss_positive_count, load_loss_state, validate_loss_options
+from utils.model_options import ensure_structure_option_defaults, validate_structure_options
+from utils.phase import PhaseConfig, phase_changed, resolve_phase
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
+from utils.sampler import log_sampler_stats
+from utils.train_common import build_train_dataloader, build_val_dataloaders, cleanup_dataloader, phase_close_mosaic, \
+    phase_imgsz, phase_rect, save_aug_debug_samples
+from utils.train_logger import TrainLogger
 from utils.torch_utils import ModelEMA, select_device, intersect_dicts, torch_distributed_zero_first, is_parallel
 from utils.wandb_logging.wandb_utils import WandbLogger, check_wandb_resume
 import datetime
@@ -41,6 +51,7 @@ logger = logging.getLogger(__name__)
 
 
 def train(hyp, opt, device, tb_writer=None):
+    apply_loss_options(hyp, opt)
     logger.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
     save_dir, epochs, batch_size, total_batch_size, weights, rank = \
         Path(opt.save_dir), opt.epochs, opt.batch_size, opt.total_batch_size, opt.weights, opt.global_rank
@@ -51,12 +62,16 @@ def train(hyp, opt, device, tb_writer=None):
     last = wdir / 'last.pt'
     best = wdir / 'best.pt'
     results_file = save_dir / 'results.txt'
+    phase_config = PhaseConfig.from_opt(opt)
+    aug_logging = getattr(opt, 'aug_profile', 'off') != 'off' or getattr(opt, 'sampler_mode', 'off') not in ('off', 'none')
+    train_logger = TrainLogger(save_dir, getattr(opt, 'log_format', 'both'),
+                               getattr(opt, 'per_class_log_interval', 10)) if rank in [-1, 0] and (phase_config.enabled or aug_logging) else None
 
     # Save run settings
     with open(save_dir / 'hyp.yaml', 'w') as f:
         yaml.dump(hyp, f, sort_keys=False)
     with open(save_dir / 'opt.yaml', 'w') as f:
-        yaml.dump(vars(opt), f, sort_keys=False)
+        yaml.safe_dump(sanitize_yaml_value(vars(opt)), f, sort_keys=False)
 
     # Configure
     plots = not opt.evolve  # create plots
@@ -78,23 +93,28 @@ def train(hyp, opt, device, tb_writer=None):
             weights, epochs, hyp = opt.weights, opt.epochs, opt.hyp  # WandbLogger might update weights, epochs if resuming
 
     nc = 1 if opt.single_cls else int(data_dict['nc'])  # number of classes
+    opt.nc = nc
     names = ['item'] if opt.single_cls and len(data_dict['names']) != 1 else data_dict['names']  # class names
     assert len(names) == nc, '%g names found for nc=%g dataset in %s' % (len(names), nc, opt.data)  # check
 
     # Model
     pretrained = weights.endswith('.pt')
+    loss_state_resume = None
     if pretrained:
         with torch_distributed_zero_first(rank):
             attempt_download(weights)  # download if not found locally
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
-        model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        loss_state_resume = ckpt.get('loss_state')
+        model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors'),
+                      head=getattr(opt, 'head', 'coupled')).to(device)  # create
         exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
         state_dict = ckpt['model'].float().state_dict()  # to FP32
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
         model.load_state_dict(state_dict, strict=False)  # load
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
     else:
-        model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors')).to(device)  # create
+        model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors'),
+                      head=getattr(opt, 'head', 'coupled')).to(device)  # create
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  # check
     train_path = data_dict['train']
@@ -131,7 +151,8 @@ def train(hyp, opt, device, tb_writer=None):
 
     # Optimizer
     nbs = 64  # nominal batch size
-    accumulate = max(round(nbs / total_batch_size), 1)  # accumulate loss before optimizing
+    base_accumulate = int(opt.grad_accumulate) if getattr(opt, 'grad_accumulate', None) else max(round(nbs / total_batch_size), 1)
+    accumulate = max(base_accumulate, 1)  # accumulate loss before optimizing
     hyp['weight_decay'] *= total_batch_size * accumulate / nbs  # scale weight_decay
     logger.info(f"Scaled weight_decay = {hyp['weight_decay']}")
 
@@ -254,6 +275,12 @@ def train(hyp, opt, device, tb_writer=None):
     gs = max(int(model.stride.max()), 32)  # grid size (max stride)
     nl = model.model[-1].nl  # number of detection layers (used for scaling hyp['obj'])
     imgsz, imgsz_test = [check_img_size(x, gs) for x in opt.img_size]  # verify imgsz are gs-multiples
+    base_imgsz, base_imgsz_test = imgsz, imgsz_test
+    phase_state = resolve_phase(start_epoch, phase_config)
+    active_phase_name = phase_state.name
+    imgsz, imgsz_test = phase_imgsz(phase_state, base_imgsz), phase_imgsz(phase_state, base_imgsz_test)
+    if train_logger:
+        train_logger.write_hyp_snapshot(start_epoch, active_phase_name, hyp)
 
     # DP mode
     if cuda and rank == -1 and torch.cuda.device_count() > 1:
@@ -264,41 +291,26 @@ def train(hyp, opt, device, tb_writer=None):
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         logger.info('Using SyncBatchNorm()')
 
-    if hasattr(create_dataloader, '__code__') and 'close_mosaic' in create_dataloader.__code__.co_varnames:
-        dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
-                                                hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
-                                                world_size=opt.world_size, workers=opt.workers,
-                                                image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '),
-                                                close_mosaic=opt.close_mosaic > 0)
-    else:
-        dataloader, dataset = create_dataloader(train_path, imgsz, batch_size, gs, opt,
-                                                hyp=hyp, augment=True, cache=opt.cache_images, rect=opt.rect, rank=rank,
-                                                world_size=opt.world_size, workers=opt.workers,
-                                                image_weights=opt.image_weights, quad=opt.quad, prefix=colorstr('train: '))
+    dataloader, dataset = build_train_dataloader(
+        train_path, imgsz, batch_size, gs, opt, hyp, rank,
+        rect=phase_rect(phase_state, opt.rect),
+        close_mosaic=phase_close_mosaic(phase_state, opt.close_mosaic > 0),
+        force_mosaic_off=phase_config.enabled and phase_close_mosaic(phase_state, False),
+        allow_rect_mosaic=phase_config.enabled and phase_rect(phase_state, opt.rect) and phase_state.mosaic is True,
+        aug_phase=active_phase_name)
 
     mlc = np.concatenate(dataset.labels, 0)[:, 0].max()  # max label class
     nb = len(dataloader)  # number of batches
     assert mlc < nc, 'Label class %g exceeds nc=%g in %s. Possible class labels are 0-%g' % (mlc, nc, opt.data, nc - 1)
+    if rank in [-1, 0] and getattr(opt, 'aug_debug_samples', 0) > 0:
+        save_aug_debug_samples(
+            dataset, save_dir, opt.aug_debug_samples, names,
+            filename=f'aug_debug_{active_phase_name}_epoch{start_epoch}.jpg')
 
     # Process 0
     if rank in [-1, 0]:
         # Create dataloaders for all validation sets
-        testloaders = []
-        for val_cfg in val_configs:
-            val_path = val_cfg['path']
-            val_name = val_cfg['name']
-            if hasattr(create_dataloader, '__code__') and 'close_mosaic' in create_dataloader.__code__.co_varnames:
-                testloader = create_dataloader(val_path, imgsz_test, batch_size * 2, gs, opt,
-                                            hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
-                                            world_size=opt.world_size, workers=opt.workers,
-                                            pad=0.5, prefix=colorstr(f'{val_name}: '),
-                                            close_mosaic=False)[0]  # 검증에서는 항상 False
-            else:
-                testloader = create_dataloader(val_path, imgsz_test, batch_size * 2, gs, opt,
-                                            hyp=hyp, cache=opt.cache_images and not opt.notest, rect=True, rank=-1,
-                                            world_size=opt.world_size, workers=opt.workers,
-                                            pad=0.5, prefix=colorstr(f'{val_name}: '))[0]
-            testloaders.append((val_name, testloader))
+        testloaders = build_val_dataloaders(val_configs, imgsz_test, batch_size, gs, opt, hyp)
 
         if not opt.resume:
             labels = np.concatenate(dataset.labels, 0)
@@ -353,15 +365,62 @@ def train(hyp, opt, device, tb_writer=None):
     scaler = amp.GradScaler(enabled=cuda)
     compute_loss_ota = ComputeLossAuxOTA(model)  # init loss class
     compute_loss = ComputeLoss(model)  # init loss class
+    load_loss_state(compute_loss_ota, loss_state_resume, logger)
+    load_loss_state(compute_loss, loss_state_resume, logger)
+    early_stopper = PhaseEarlyStopping(
+        patience=getattr(opt, 'patience', 20),
+        active_phase='phase3',
+        enabled=phase_config.enabled and getattr(opt, 'early_stop_phase', 'phase3') == 'phase3')
     logger.info(f'Image sizes {imgsz} train, {imgsz_test} test\n'
                 f'Using {dataloader.num_workers} dataloader workers\n'
                 f'Logging results to {save_dir}\n'
                 f'Starting training for {epochs} epochs...')
     torch.save(model, wdir / 'init.pt')
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
+        epoch_start_time = time.time()
+        stop_training = False
         model.train()
-        logger.info(f"current {epoch}, epochs{epochs}, close mosaic{opt.close_mosaic}, epochs - opt.close_mosaic {epochs - opt.close_mosaic}")
-        if opt.close_mosaic > 0 and epoch == (epochs - opt.close_mosaic):
+
+        if phase_config.enabled:
+            next_phase_state = resolve_phase(epoch, phase_config)
+            if phase_changed(phase_state, next_phase_state):
+                previous_phase = phase_state.name
+                phase_state = next_phase_state
+                active_phase_name = phase_state.name
+                imgsz = phase_imgsz(phase_state, base_imgsz)
+                imgsz_test = phase_imgsz(phase_state, base_imgsz_test)
+                del dataloader, dataset
+                if rank in [-1, 0]:
+                    del testloaders
+                cleanup_dataloader()
+                dataloader, dataset = build_train_dataloader(
+                    train_path, imgsz, batch_size, gs, opt, hyp, rank,
+                    rect=phase_rect(phase_state, opt.rect),
+                    close_mosaic=phase_close_mosaic(phase_state, False),
+                    force_mosaic_off=phase_close_mosaic(phase_state, False),
+                    allow_rect_mosaic=phase_rect(phase_state, opt.rect) and phase_state.mosaic is True,
+                    aug_phase=active_phase_name)
+                nb = len(dataloader)
+                model.class_weights = labels_to_class_weights(dataset.labels, nc).to(device) * nc
+                if rank in [-1, 0]:
+                    if getattr(opt, 'aug_debug_samples', 0) > 0:
+                        save_aug_debug_samples(
+                            dataset, save_dir, opt.aug_debug_samples, names,
+                            filename=f'aug_debug_{active_phase_name}_epoch{epoch}.jpg')
+                    testloaders = build_val_dataloaders(val_configs, imgsz_test, batch_size, gs, opt, hyp)
+                    if train_logger:
+                        train_logger.log_phase_transition(
+                            epoch, previous_phase, active_phase_name, imgsz,
+                            phase_rect(phase_state, opt.rect), getattr(dataset, 'mosaic', None),
+                            opt.hyp, True, True, getattr(dataloader, 'persistent_workers', None),
+                            'phase boundary')
+                        train_logger.write_hyp_snapshot(epoch, active_phase_name, hyp)
+            else:
+                phase_state = next_phase_state
+
+        if not phase_config.enabled:
+            logger.info(f"current {epoch}, epochs{epochs}, close mosaic{opt.close_mosaic}, epochs - opt.close_mosaic {epochs - opt.close_mosaic}")
+        if not phase_config.enabled and opt.close_mosaic > 0 and epoch == (epochs - opt.close_mosaic):
             logger.info(f"Closing mosaic augmentation at epoch {epoch}")
             dataset.mosaic = False
             if hasattr(dataloader, 'dataset'):
@@ -385,7 +444,8 @@ def train(hyp, opt, device, tb_writer=None):
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
         mloss = torch.zeros(4, device=device)  # mean losses
-        if rank != -1:
+        epoch_positive_count = 0
+        if hasattr(getattr(dataloader, 'sampler', None), 'set_epoch'):
             dataloader.sampler.set_epoch(epoch)
         pbar = enumerate(dataloader)
         logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'labels', 'img_size'))
@@ -400,7 +460,7 @@ def train(hyp, opt, device, tb_writer=None):
             if ni <= nw:
                 xi = [0, nw]  # x interp
                 # model.gr = np.interp(ni, xi, [0.0, 1.0])  # iou loss ratio (obj_loss = 1.0 or iou)
-                accumulate = max(1, np.interp(ni, xi, [1, nbs / total_batch_size]).round())
+                accumulate = max(1, np.interp(ni, xi, [1, base_accumulate]).round())
                 for j, x in enumerate(optimizer.param_groups):
                     # bias lr falls from 0.1 to lr0, all other lrs rise from 0.0 to lr0
                     x['lr'] = np.interp(ni, xi, [hyp['warmup_bias_lr'] if j == 2 else 0.0, x['initial_lr'] * lf(epoch)])
@@ -419,6 +479,7 @@ def train(hyp, opt, device, tb_writer=None):
             with amp.autocast(enabled=cuda):
                 pred = model(imgs)  # forward
                 loss, loss_items = compute_loss_ota(pred, targets.to(device), imgs)  # loss scaled by batch_size
+                epoch_positive_count += get_loss_positive_count(compute_loss_ota)
                 if rank != -1:
                     loss *= opt.world_size  # gradient averaged between devices in DDP mode
                 if opt.quad:
@@ -460,17 +521,19 @@ def train(hyp, opt, device, tb_writer=None):
         # Scheduler
         lr = [x['lr'] for x in optimizer.param_groups]  # for tensorboard
         scheduler.step()
+        if rank in [-1, 0] and getattr(opt, 'sampler_mode', 'off') == 'weighted':
+            log_sampler_stats(getattr(dataloader, 'sampler', None), epoch, dataset.labels, nc, save_dir)
 
         # DDP process 0 or single-GPU
         if rank in [-1, 0]:
             # mAP
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride', 'class_weights'])
             final_epoch = epoch + 1 == epochs
+            all_val_results = []
             if not opt.notest or final_epoch:  # Calculate mAP
                 wandb_logger.current_epoch = epoch + 1
 
                 # Evaluate on all validation sets
-                all_val_results = []
                 for val_name, testloader in testloaders:
                     logger.info(f'\n{"="*60}\nEvaluating on {val_name}\n{"="*60}')
                     results, maps, times, per_class = test.test(data_dict,
@@ -491,7 +554,8 @@ def train(hyp, opt, device, tb_writer=None):
                         'results': results,
                         'maps': maps,
                         'times': times,
-                        'per_class': per_class
+                        'per_class': per_class,
+                        'sample_count': len(testloader.dataset) if hasattr(testloader, 'dataset') else ''
                     })
 
                 # Use first validation set's results for backward compatibility (fitness calculation)
@@ -500,6 +564,9 @@ def train(hyp, opt, device, tb_writer=None):
 
                 # Write results to file
                 with open(results_file, 'a') as f:
+                    f.write(s + '%10.4g' * 7 % results + '\n')
+
+                with open(save_dir / 'results_detail.txt', 'a') as f:
                     # Write epoch and training loss
                     f.write(s)
 
@@ -539,9 +606,26 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
-            if fi > best_fitness:
+            is_best = fi > best_fitness
+            if is_best:
                 best_fitness = fi
-            wandb_logger.end_epoch(best_result=best_fitness == fi)
+            wandb_logger.end_epoch(best_result=is_best)
+            if train_logger:
+                gpu_mem_gb = torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0.0
+                train_logger.log_epoch(epoch, active_phase_name, mloss, results, lr, gpu_mem_gb,
+                                       time.time() - epoch_start_time)
+                train_logger.log_loss_detail(epoch, active_phase_name, mloss,
+                                             positive_count=epoch_positive_count,
+                                             assigner=getattr(opt, 'assign', 'simota'),
+                                             loss_box=getattr(opt, 'loss_box', 'ciou'),
+                                             loss_cls=getattr(opt, 'loss_cls', 'bce'),
+                                             head=getattr(opt, 'head', 'coupled'))
+                train_logger.log_scenario_metrics(epoch, active_phase_name, all_val_results)
+                per_class = all_val_results[0]['per_class'] if all_val_results else None
+                train_logger.log_per_class(epoch, active_phase_name, per_class, is_best=is_best)
+            if early_stopper.update(epoch, active_phase_name, fi):
+                logger.info(f'Early stopping at epoch {epoch} in {active_phase_name}')
+                stop_training = True
 
             # Save model
             if (not opt.nosave) or (final_epoch and not opt.evolve):  # if save
@@ -554,6 +638,7 @@ def train(hyp, opt, device, tb_writer=None):
                         'updates': ema.updates,
                         'optimizer': optimizer.state_dict(),
                         'wandb_id': wandb_logger.wandb_run.id if wandb_logger.wandb else None,
+                        'loss_state': build_loss_state(opt, compute_loss_ota),
                         'mosaic_active': dataset.mosaic}
                 # Save last, best and delete
                 if opt.model_saveoptimizer:
@@ -562,24 +647,28 @@ def train(hyp, opt, device, tb_writer=None):
                     torch.save(ckpt, wdir / 'epoch_{:03d}.pt'.format(epoch))
                     if best_fitness == fi:
                         torch.save(ckpt, wdir / 'best_{:03d}.pt'.format(epoch))
-                        torch.save(ckpt, wdir / 'best.pt'.format(epoch))
+                        torch.save(ckpt, best)
                     
                     # 저장 후 optimizer 제거
                     strip_optimizer(last)
                     strip_optimizer(wdir / 'epoch_{:03d}.pt'.format(epoch))
                     if best_fitness == fi:
                         strip_optimizer(wdir / 'best_{:03d}.pt'.format(epoch))
-                        strip_optimizer(wdir / 'best.pt'.format(epoch))
+                        strip_optimizer(best)
                 else:
                     # optimizer 포함해서 저장 (원본 ckpt 그대로)
                     torch.save(ckpt, last)
                     torch.save(ckpt, wdir / 'epoch_{:03d}.pt'.format(epoch))
                     if best_fitness == fi:
                         torch.save(ckpt, wdir / 'best_{:03d}.pt'.format(epoch))
+                        torch.save(ckpt, best)
 
                 del ckpt
                 torch.cuda.empty_cache()
                 gc.collect()
+
+        if stop_training:
+            break
 
         # end epoch ----------------------------------------------------------------------------------------------------
     # end training
@@ -594,23 +683,53 @@ def train(hyp, opt, device, tb_writer=None):
         # Test best.pt
         logger.info('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
         if opt.data.endswith('coco.yaml') and nc == 80:  # if COCO
-            for m in (last, best) if best.exists() else (last):  # speed, mAP tests
-                results, _, _ = test.test(opt.data,
-                                          batch_size=batch_size * 2,
-                                          imgsz=imgsz_test,
-                                          conf_thres=0.001,
-                                          iou_thres=0.7,
-                                          model=attempt_load(m, device).half(),
-                                          single_cls=opt.single_cls,
-                                          dataloader=testloader,
-                                          save_dir=save_dir,
-                                          save_json=True,
-                                          plots=False,
-                                          is_coco=is_coco,
-                                          v5_metric=opt.v5_metric)
+            for m in (last, best) if best.exists() else (last,):  # speed, mAP tests
+                results, _, _, _ = test.test(opt.data,
+                                             batch_size=batch_size * 2,
+                                             imgsz=imgsz_test,
+                                             conf_thres=0.001,
+                                             iou_thres=0.7,
+                                             model=attempt_load(m, device).half(),
+                                             single_cls=opt.single_cls,
+                                             dataloader=testloader,
+                                             save_dir=save_dir,
+                                             save_json=True,
+                                             plots=False,
+                                             is_coco=is_coco,
+                                             v5_metric=opt.v5_metric)
 
         # Strip optimizers
         final = best if best.exists() else last  # final model
+        if train_logger:
+            stage_name = '1.3.4' if aug_logging else '1.3.3'
+            train_logger.write_stage_result(
+                stage=stage_name,
+                baseline_run=None,
+                current_run=str(save_dir),
+                head=getattr(opt, 'head', 'coupled'),
+                loss_box=getattr(opt, 'loss_box', 'ciou'),
+                assign=getattr(opt, 'assign', 'simota'),
+                loss_cls=getattr(opt, 'loss_cls', 'bce'),
+                aug_profile=getattr(opt, 'aug_profile', 'off'),
+                sampler_mode=getattr(opt, 'sampler_mode', 'off'),
+                p2_head=getattr(opt, 'p2_head', 'none'),
+                neck_mod=getattr(opt, 'neck_mod', 'none'),
+                phase_train=phase_config.enabled,
+                phase_boundaries=phase_config.boundaries(),
+                best_epoch=None,
+                best_map_50_95=float(results[3]) if len(results) > 3 else None,
+                profile_json=None,
+                baseline_gflops=None,
+                current_gflops=None,
+                gflops_delta_percent=None,
+                primary_mAP=float(results[3]) if len(results) > 3 else None,
+                mAP_0_5=float(results[2]) if len(results) > 2 else None,
+                small_AP=None,
+                rare_recall=None,
+                trt_latency=None,
+                export_check_json=None,
+                output_contract_json=None,
+                status='completed')
         for f in last, best:
             if f.exists():
                 strip_optimizer(f)  # strip optimizers
@@ -634,8 +753,10 @@ if __name__ == '__main__':
     parser.add_argument('--data', type=str, default='data/coco.yaml', help='data.yaml path')
     parser.add_argument('--hyp', type=str, default='data/hyp.scratch.p5.yaml', help='hyperparameters path')
     parser.add_argument('--epochs', type=int, default=300)
-    parser.add_argument('--batch-size', type=int, default=16, help='total batch size for all GPUs')
-    parser.add_argument('--img-size', nargs='+', type=int, default=[640, 640], help='[train, test] image sizes')
+    parser.add_argument('--batch-size', '--batch', dest='batch_size', type=int, default=16,
+                        help='total batch size for all GPUs')
+    parser.add_argument('--img-size', '--img', dest='img_size', nargs='+', type=int, default=[640, 640],
+                        help='[train, test] image sizes')
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
@@ -666,8 +787,41 @@ if __name__ == '__main__':
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
     parser.add_argument('--close-mosaic', type=int, default=0, help='close mosaic augmentation (epochs)')
     parser.add_argument('--model-saveoptimizer', action='store_true', help='Save model optimizer state')
+    parser.add_argument('--phase-train', choices=['off', 'on'], default='off')
+    parser.add_argument('--phase1-epochs', type=int, default=290)
+    parser.add_argument('--phase2-epochs', type=int, default=70)
+    parser.add_argument('--phase3-epochs', type=int, default=40)
+    parser.add_argument('--phase2-img', nargs=2, type=int, default=None)
+    parser.add_argument('--phase3-img', nargs=2, type=int, default=None)
+    parser.add_argument('--rect-size-l', nargs=2, type=int, default=[640, 384])
+    parser.add_argument('--rect-size-w6', nargs=2, type=int, default=[1280, 736])
+    parser.add_argument('--phase2-rect', dest='phase2_rect', action='store_true', default=True)
+    parser.add_argument('--no-phase2-rect', dest='phase2_rect', action='store_false')
+    parser.add_argument('--phase2-mosaic', choices=['on', 'off'], default='on')
+    parser.add_argument('--phase3-mosaic', choices=['off'], default='off')
+    parser.add_argument('--aux', choices=['auto', 'on', 'off'], default='auto')
+    parser.add_argument('--grad-accumulate', type=int, default=None)
+    parser.add_argument('--early-stop-phase', choices=['phase3', 'off'], default='phase3')
+    parser.add_argument('--patience', type=int, default=20)
+    parser.add_argument('--profile', choices=['off', 'on'], default='off')
+    parser.add_argument('--per-class-log-interval', type=int, default=10)
+    parser.add_argument('--log-format', choices=['txt', 'csv', 'both'], default='both')
+    parser.add_argument('--no-verbose', action='store_true')
+    parser.add_argument('--head', choices=['coupled', 'decoupled'], default='coupled')
+    parser.add_argument('--loss-box', choices=['ciou', 'wiou_v3'], default='ciou')
+    parser.add_argument('--assign', choices=['simota', 'tal'], default='simota')
+    parser.add_argument('--loss-cls', choices=['bce', 'vfl'], default='bce')
+    parser.add_argument('--aug-profile', choices=['off', 'cctv_pixel', 'cctv_paste'], default='off')
+    parser.add_argument('--sampler-mode', choices=['off', 'none', 'weighted'], default='off')
+    parser.add_argument('--aug-debug-samples', type=int, default=0)
+    parser.add_argument('--hard-negative-manifest', type=str, default='')
+    parser.add_argument('--p2-head', choices=['none', 'anchor'], default='none')
+    parser.add_argument('--neck-mod', choices=['none', 'scdown'], default='none')
 
     opt = parser.parse_args()
+    ensure_aug_option_defaults(opt)
+    ensure_structure_option_defaults(opt)
+    validate_loss_options(opt, parser)
 
     # Set DDP variables
     opt.total_batch_size = opt.batch_size
@@ -675,6 +829,8 @@ if __name__ == '__main__':
     opt.global_rank = int(os.environ.get('RANK', -1))
     opt.local_rank = int(os.environ.get('LOCAL_RANK', -1))
     set_logging(opt.global_rank)
+    validate_aug_options(opt, parser)
+    validate_structure_options(opt, parser)
     #if opt.global_rank in [-1, 0]:
     #    check_git_status()
     #    check_requirements()
@@ -687,6 +843,12 @@ if __name__ == '__main__':
         apriori = opt.global_rank, opt.local_rank
         with open(Path(ckpt).parent.parent / 'opt.yaml') as f:
             opt = argparse.Namespace(**yaml.load(f, Loader=yaml.SafeLoader))  # replace
+        ensure_loss_option_defaults(opt)
+        ensure_aug_option_defaults(opt)
+        ensure_structure_option_defaults(opt)
+        validate_loss_options(opt, parser)
+        validate_aug_options(opt, parser)
+        validate_structure_options(opt, parser)
         opt.cfg, opt.weights, opt.resume, opt.batch_size, opt.global_rank, opt.local_rank = '', ckpt, True, opt.total_batch_size, *apriori  # reinstate
         logger.info('Resuming training from %s' % ckpt)
     else:
@@ -696,6 +858,9 @@ if __name__ == '__main__':
         opt.img_size.extend([opt.img_size[-1]] * (2 - len(opt.img_size)))  # extend to 2 sizes (train, test)
         opt.name = 'evolve' if opt.evolve else opt.name
         opt.save_dir = increment_path(Path(opt.project) / opt.name, exist_ok=opt.exist_ok | opt.evolve)  # increment run
+    ensure_loss_option_defaults(opt)
+    ensure_aug_option_defaults(opt)
+    ensure_structure_option_defaults(opt)
 
     # DDP mode
     opt.total_batch_size = opt.batch_size

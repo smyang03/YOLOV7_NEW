@@ -1,5 +1,13 @@
 # 1.3.4 Code-Level Development Requirements
 
+## 공통 예외 사항 - 원 코드 유지 개발
+
+- 본 차수의 새 기능은 기본값으로 비활성화한다. 플래그를 켜지 않으면 기존 YOLOv7 학습, 평가, export 동작이 유지되어야 한다.
+- 기존 함수/클래스는 버그 수정, 호환성 보강, 공통 helper 호출 연결에 한해서만 직접 수정한다.
+- 신규 기능은 가능한 `utils/*`, `models/*`의 새 helper/class/wrapper로 분리하고, 기존 entrypoint는 기존 CLI와 출력 경로를 유지한다.
+- `train.py`, `train_aux.py`, `test.py`, `export.py`는 기존 옵션명을 삭제하지 않는다. alias를 추가할 때도 기존 `dest`와 결과 파일명을 바꾸지 않는다.
+- `train_aux.py`는 즉시 삭제하거나 대체하지 않는다. 공통 helper를 먼저 만들고 AUX/W6 smoke 검증 후 얇은 wrapper로 축소한다.
+
 ## 1.3.4.1 코드 구현 상세
 
 이 세부 항목은 현재 augmentation이 `utils/datasets.py` 안에 집중되어 있는 구조를 고려해 policy, pixel augmentation, label-changing augmentation, sampler를 분리하는 구현 기준을 고정한다.
@@ -20,7 +28,7 @@
 
 ```python
 parser.add_argument('--aug-profile', choices=['off', 'cctv_pixel', 'cctv_paste'], default='off')
-parser.add_argument('--sampler-mode', choices=['off', 'weighted'], default='off')
+parser.add_argument('--sampler-mode', choices=['off', 'none', 'weighted'], default='off')
 parser.add_argument('--aug-debug-samples', type=int, default=0)
 parser.add_argument('--hard-negative-manifest', type=str, default='')
 ```
@@ -112,7 +120,7 @@ B2/B3는 B1 시각 검증이 통과한 뒤 진행한다.
 
 | 파일 | 구분 | 요구사항 |
 | --- | --- | --- |
-| `train.py` | 수정 | `--aug-profile`, `--sampler-mode`, `--aug-debug` 플래그를 저장하고 dataloader에 전달한다. |
+| `train.py` | 수정 | `--aug-profile`, `--sampler-mode`, `--aug-debug-samples`, `--hard-negative-manifest` 플래그를 저장하고 dataloader에 전달한다. |
 | `utils/datasets.py` | 수정 | 기존 mosaic/random_perspective 흐름에 CCTV aug hook을 추가한다. bbox 좌표 변환 순서를 명확히 유지한다. |
 | `utils/cctv_augmentations.py` | 신규 | pixel aug, Patch-Paste, Hard Negative Paste를 함수 단위로 분리한다. |
 | `utils/augment_policy.py` | 신규 | `cctv_pixel`, `cctv_paste`, `off` profile과 phase별 aug enable/disable 정책을 제공한다. |
@@ -233,8 +241,9 @@ Phase 3는 최종 입력 분포 안정화 구간이므로 label-changing aug를 
 
 ## 6. Sampler 계약
 
-- `--sampler-mode none|weighted`
+- `--sampler-mode off|none|weighted`
 - `weighted` 사용 시 `--image-weights`와 중복 사용하지 않는다.
+- `weighted` 사용 시 rectangular batch grouping은 유지할 수 없으므로 기존 `--image-weights`와 동일하게 rect batch를 자동 해제한다.
 - argparse `store_true` 옵션인 `--image-weights`에는 `False` 값을 전달하지 않는다. sampler 사용 시 해당 옵션을 생략한다.
 - class frequency는 label cache에서 계산한다.
 - 빈 라벨 이미지는 hard negative 비율 기준으로 제한한다.
@@ -270,6 +279,8 @@ Phase 3는 최종 입력 분포 안정화 구간이므로 label-changing aug를 
 - `recall`
 - `false_positive_per_image`
 - `sample_count`
+
+현재 `test.test()` 반환값에는 예측 수/FP count가 포함되지 않으므로 `false_positive_per_image`는 빈 값으로 기록한다. 이 값은 후속 평가 확장에서 detection count를 반환하도록 만든 뒤 계산한다.
 
 ## 8. 통과 기준
 
@@ -318,3 +329,33 @@ augmentation은 시각적으로 정상이어도 label 오염을 만들 수 있�
 | `1.3.4-P6` | scenario metric 연결 | `scenario_metrics.csv` 생성 |
 
 처음 구현하는 pixel aug 최소 세트는 SpiderWeb, ToGray, CLAHE, blur 계열로 제한한다. LensFlare, RandomSunFlare, Helmet paste, MixUp, Rolling Shutter는 기본 세트 통과 후 옵션으로만 추가한다.
+
+## 12. 구현 반영 상태 - 2026-05-22
+
+반영 완료:
+- `utils/cctv_augmentations.py`: SpiderWeb, Gray, CLAHE, MotionBlur, JPEG compression, overexposure, Patch-Paste, hard-negative paste 구현.
+- `utils/augment_policy.py`: `off`, `cctv_pixel`, `cctv_paste` profile과 phase별 label-changing aug 비활성화 규칙 구현.
+- `utils/datasets.py`: 기존 mosaic/random_perspective/HSV 흐름 뒤, tensor 변환 전 CCTV augmentation hook 연결.
+- `utils/sampler.py`: 단일 GPU class-balanced weighted sampler와 `sampler_stats.csv` 기록 구현.
+- `tools/check_aug_visual.py`: aug sample 저장, bbox/class range 점검, `aug_check.json` 생성.
+- `tools/check_labels.py`: train/val label 포맷, class id, bbox range 점검.
+- `tools/mine_hard_negatives.py`: empty-label 이미지 기반 hard negative crop manifest 생성.
+- `train.py`, `train_aux.py`: augmentation/sampler CLI, 옵션 검증, stage result, scenario metric 기록 연결.
+- `--aug-debug-samples`: 학습 시작 및 phase 전환 시 `aug_debug/*.jpg` 저장 연결.
+- `utils/plots.py`: `results_detail.txt`가 `plot_results()` 숫자 파싱 대상에 들어가지 않도록 필터링.
+
+검증 완료:
+- `python -m py_compile ...`로 1.3.4 관련 신규/수정 파일 문법 확인.
+- `python train.py --help`, `python train_aux.py --help`에서 1.3.4 CLI 노출 확인.
+- `tools/check_labels.py` 임시 YOLO 데이터셋 통과.
+- `tools/check_aug_visual.py --aug-profile cctv_paste --hard-negative-manifest ...` 통과, hard-negative paste 발생 확인.
+- `train.py` CPU 1 epoch smoke 통과, `sampler_stats.csv`, `scenario_metrics.csv`, `stage_result.yaml(stage: 1.3.4)` 생성 확인.
+- rect+mosaic dataloader smoke 통과, weighted sampler 사용 시 rect 자동 해제 확인.
+
+## 13. 남은 주의점 및 후속 처리
+
+- `scenario_metrics.csv`의 `false_positive_per_image`는 현재 빈 값으로 기록한다.
+- 원인: 현재 `test.test()` 반환값에는 validation image별 detection count, FP count, scenario별 예측 집계가 포함되지 않는다.
+- 현재 1.3.4 범위에서는 scenario 이름, AP@0.5, recall, sample count까지만 기록한다.
+- 후속 처리: 평가 확장 차수에서 `test.test()` 또는 별도 evaluator가 detection count와 FP count를 반환하도록 만든 뒤 `false_positive_per_image = false_positive_count / image_count`로 계산한다.
+- 이 값이 구현되기 전에는 hard-negative 효과 판단을 `sampler_stats.csv`, `aug_check.json`, validation mAP/recall, 수동 오탐 샘플 리뷰로 보조 평가한다.

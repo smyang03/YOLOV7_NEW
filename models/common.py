@@ -109,6 +109,17 @@ class Conv(nn.Module):
 
     def fuseforward(self, x):
         return self.act(self.conv(x))
+
+
+class SCDown(nn.Module):
+    # Simple convolutional downsampling block for W6 neck experiments.
+    def __init__(self, c1, c2, k=3, s=2):
+        super(SCDown, self).__init__()
+        self.cv1 = Conv(c1, c2, 1, 1)
+        self.cv2 = Conv(c2, c2, k, s)
+
+    def forward(self, x):
+        return self.cv2(self.cv1(x))
     
 
 class RobustConv(nn.Module):

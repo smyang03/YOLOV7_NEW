@@ -5,6 +5,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from utils.general import bbox_iou, bbox_alpha_iou, box_iou, box_giou, box_diou, box_ciou, xywh2xyxy
+from utils.loss_components import box_loss_from_iou, classification_loss, init_loss_options
+from utils.tal import assignment_cost
 from utils.torch_utils import is_parallel
 
 
@@ -437,6 +439,7 @@ class ComputeLoss:
         g = h['fl_gamma']  # focal loss gamma
         if g > 0:
             BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
+        init_loss_options(self, h, device)
 
         det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
         self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.25, 0.06, .02])  # P3-P7
@@ -451,6 +454,7 @@ class ComputeLoss:
         device = targets.device
         lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
         tcls, tbox, indices, anchors = self.build_targets(p, targets)  # targets
+        self.last_positive_count = int(sum(x[0].numel() for x in indices))
 
         # Losses
         for i, pi in enumerate(p):  # layer index, layer predictions
@@ -465,18 +469,16 @@ class ComputeLoss:
                 pxy = ps[:, :2].sigmoid() * 2. - 0.5
                 pwh = (ps[:, 2:4].sigmoid() * 2) ** 2 * anchors[i]
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
-                iou = bbox_iou(pbox.T, tbox[i], x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
-                lbox += (1.0 - iou).mean()  # iou loss
+                iou = bbox_iou(pbox.T, tbox[i], x1y1x2y2=False,
+                               CIoU=self.loss_box == 'ciou')  # iou(prediction, target)
+                lbox += box_loss_from_iou(iou, self).mean()  # iou loss
 
                 # Objectness
                 tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
 
                 # Classification
                 if self.nc > 1:  # cls loss (only if multiple classes)
-                    t = torch.full_like(ps[:, 5:], self.cn, device=device)  # targets
-                    t[range(n), tcls[i]] = self.cp
-                    #t[t==self.cp] = iou.detach().clamp(0).type(t.dtype)
-                    lcls += self.BCEcls(ps[:, 5:], t)  # BCE
+                    lcls += classification_loss(self, ps[:, 5:], tcls[i], iou)
 
                 # Append targets to text file
                 # with open('targets.txt', 'a') as file:
@@ -571,6 +573,7 @@ class ComputeLossOTA:
         g = h['fl_gamma']  # focal loss gamma
         if g > 0:
             BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
+        init_loss_options(self, h, device)
 
         det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
         self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.25, 0.06, .02])  # P3-P7
@@ -583,6 +586,7 @@ class ComputeLossOTA:
         device = targets.device
         lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
         bs, as_, gjs, gis, targets, anchors = self.build_targets(p, targets, imgs)
+        self.last_positive_count = int(sum(x.numel() for x in bs))
         pre_gen_gains = [torch.tensor(pp.shape, device=device)[[3, 2, 3, 2]] for pp in p] 
     
 
@@ -603,8 +607,9 @@ class ComputeLossOTA:
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
                 selected_tbox = targets[i][:, 2:6] * pre_gen_gains[i]
                 selected_tbox[:, :2] -= grid
-                iou = bbox_iou(pbox.T, selected_tbox, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
-                lbox += (1.0 - iou).mean()  # iou loss
+                iou = bbox_iou(pbox.T, selected_tbox, x1y1x2y2=False,
+                               CIoU=self.loss_box == 'ciou')  # iou(prediction, target)
+                lbox += box_loss_from_iou(iou, self).mean()  # iou loss
 
                 # Objectness
                 tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
@@ -612,9 +617,7 @@ class ComputeLossOTA:
                 # Classification
                 selected_tcls = targets[i][:, 1].long()
                 if self.nc > 1:  # cls loss (only if multiple classes)
-                    t = torch.full_like(ps[:, 5:], self.cn, device=device)  # targets
-                    t[range(n), selected_tcls] = self.cp
-                    lcls += self.BCEcls(ps[:, 5:], t)  # BCE
+                    lcls += classification_loss(self, ps[:, 5:], selected_tcls, iou)
 
                 # Append targets to text file
                 # with open('targets.txt', 'a') as file:
@@ -712,9 +715,6 @@ class ComputeLossOTA:
 
             pair_wise_iou_loss = -torch.log(pair_wise_iou + 1e-8)
 
-            top_k, _ = torch.topk(pair_wise_iou, min(10, pair_wise_iou.shape[1]), dim=1)
-            dynamic_ks = torch.clamp(top_k.sum(1).int(), min=1)
-
             gt_cls_per_image = (
                 F.one_hot(this_target[:, 1].to(torch.int64), self.nc)
                 .float()
@@ -727,6 +727,7 @@ class ComputeLossOTA:
                 p_cls.float().unsqueeze(0).repeat(num_gt, 1, 1).sigmoid_()
                 * p_obj.unsqueeze(0).repeat(num_gt, 1, 1).sigmoid_()
             )
+            cls_scores = (cls_preds_.detach() * gt_cls_per_image).sum(-1)
 
             y = cls_preds_.sqrt_()
             pair_wise_cls_loss = F.binary_cross_entropy_with_logits(
@@ -739,6 +740,8 @@ class ComputeLossOTA:
                 + 3.0 * pair_wise_iou_loss
             )
 
+            cost, dynamic_ks = assignment_cost(
+                cost, pair_wise_iou, cls_scores, self.hyp, self.assign, default_topk=10)
             matching_matrix = torch.zeros_like(cost, device=device)
 
             for gt_idx in range(num_gt):
@@ -747,7 +750,7 @@ class ComputeLossOTA:
                 )
                 matching_matrix[gt_idx][pos_idx] = 1.0
 
-            del top_k, dynamic_ks
+            del dynamic_ks
             anchor_matching_gt = matching_matrix.sum(0)
             if (anchor_matching_gt > 1).sum() > 0:
                 _, cost_argmin = torch.min(cost[:, anchor_matching_gt > 1], dim=0)
@@ -865,6 +868,7 @@ class ComputeLossBinOTA:
         g = h['fl_gamma']  # focal loss gamma
         if g > 0:
             BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
+        init_loss_options(self, h, device)
 
         det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
         self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.25, 0.06, .02])  # P3-P7
@@ -1191,6 +1195,7 @@ class ComputeLossAuxOTA:
         g = h['fl_gamma']  # focal loss gamma
         if g > 0:
             BCEcls, BCEobj = FocalLoss(BCEcls, g), FocalLoss(BCEobj, g)
+        init_loss_options(self, h, device)
 
         det = model.module.model[-1] if is_parallel(model) else model.model[-1]  # Detect() module
         self.balance = {3: [4.0, 1.0, 0.4]}.get(det.nl, [4.0, 1.0, 0.25, 0.06, .02])  # P3-P7
@@ -1204,6 +1209,7 @@ class ComputeLossAuxOTA:
         lcls, lbox, lobj = torch.zeros(1, device=device), torch.zeros(1, device=device), torch.zeros(1, device=device)
         bs_aux, as_aux_, gjs_aux, gis_aux, targets_aux, anchors_aux = self.build_targets2(p[:self.nl], targets, imgs)
         bs, as_, gjs, gis, targets, anchors = self.build_targets(p[:self.nl], targets, imgs)
+        self.last_positive_count = int(sum(x.numel() for x in bs) + sum(x.numel() for x in bs_aux))
         pre_gen_gains_aux = [torch.tensor(pp.shape, device=device)[[3, 2, 3, 2]] for pp in p[:self.nl]] 
         pre_gen_gains = [torch.tensor(pp.shape, device=device)[[3, 2, 3, 2]] for pp in p[:self.nl]] 
     
@@ -1228,8 +1234,9 @@ class ComputeLossAuxOTA:
                 pbox = torch.cat((pxy, pwh), 1)  # predicted box
                 selected_tbox = targets[i][:, 2:6] * pre_gen_gains[i]
                 selected_tbox[:, :2] -= grid
-                iou = bbox_iou(pbox.T, selected_tbox, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
-                lbox += (1.0 - iou).mean()  # iou loss
+                iou = bbox_iou(pbox.T, selected_tbox, x1y1x2y2=False,
+                               CIoU=self.loss_box == 'ciou')  # iou(prediction, target)
+                lbox += box_loss_from_iou(iou, self).mean()  # iou loss
 
                 # Objectness
                 tobj[b, a, gj, gi] = (1.0 - self.gr) + self.gr * iou.detach().clamp(0).type(tobj.dtype)  # iou ratio
@@ -1237,9 +1244,7 @@ class ComputeLossAuxOTA:
                 # Classification
                 selected_tcls = targets[i][:, 1].long()
                 if self.nc > 1:  # cls loss (only if multiple classes)
-                    t = torch.full_like(ps[:, 5:], self.cn, device=device)  # targets
-                    t[range(n), selected_tcls] = self.cp
-                    lcls += self.BCEcls(ps[:, 5:], t)  # BCE
+                    lcls += classification_loss(self, ps[:, 5:], selected_tcls, iou)
 
                 # Append targets to text file
                 # with open('targets.txt', 'a') as file:
@@ -1255,8 +1260,9 @@ class ComputeLossAuxOTA:
                 pbox_aux = torch.cat((pxy_aux, pwh_aux), 1)  # predicted box
                 selected_tbox_aux = targets_aux[i][:, 2:6] * pre_gen_gains_aux[i]
                 selected_tbox_aux[:, :2] -= grid_aux
-                iou_aux = bbox_iou(pbox_aux.T, selected_tbox_aux, x1y1x2y2=False, CIoU=True)  # iou(prediction, target)
-                lbox += 0.25 * (1.0 - iou_aux).mean()  # iou loss
+                iou_aux = bbox_iou(pbox_aux.T, selected_tbox_aux, x1y1x2y2=False,
+                                   CIoU=self.loss_box == 'ciou')  # iou(prediction, target)
+                lbox += 0.25 * box_loss_from_iou(iou_aux, self).mean()  # iou loss
 
                 # Objectness
                 tobj_aux[b_aux, a_aux, gj_aux, gi_aux] = (1.0 - self.gr) + self.gr * iou_aux.detach().clamp(0).type(tobj_aux.dtype)  # iou ratio
@@ -1264,9 +1270,7 @@ class ComputeLossAuxOTA:
                 # Classification
                 selected_tcls_aux = targets_aux[i][:, 1].long()
                 if self.nc > 1:  # cls loss (only if multiple classes)
-                    t_aux = torch.full_like(ps_aux[:, 5:], self.cn, device=device)  # targets
-                    t_aux[range(n_aux), selected_tcls_aux] = self.cp
-                    lcls += 0.25 * self.BCEcls(ps_aux[:, 5:], t_aux)  # BCE
+                    lcls += 0.25 * classification_loss(self, ps_aux[:, 5:], selected_tcls_aux, iou_aux)
 
             obji = self.BCEobj(pi[..., 4], tobj)
             obji_aux = self.BCEobj(pi_aux[..., 4], tobj_aux)
@@ -1357,9 +1361,6 @@ class ComputeLossAuxOTA:
 
             pair_wise_iou_loss = -torch.log(pair_wise_iou + 1e-8)
 
-            top_k, _ = torch.topk(pair_wise_iou, min(20, pair_wise_iou.shape[1]), dim=1)
-            dynamic_ks = torch.clamp(top_k.sum(1).int(), min=1)
-
             gt_cls_per_image = (
                 F.one_hot(this_target[:, 1].to(torch.int64), self.nc)
                 .float()
@@ -1372,6 +1373,7 @@ class ComputeLossAuxOTA:
                 p_cls.float().unsqueeze(0).repeat(num_gt, 1, 1).sigmoid_()
                 * p_obj.unsqueeze(0).repeat(num_gt, 1, 1).sigmoid_()
             )
+            cls_scores = (cls_preds_.detach() * gt_cls_per_image).sum(-1)
 
             y = cls_preds_.sqrt_()
             pair_wise_cls_loss = F.binary_cross_entropy_with_logits(
@@ -1384,6 +1386,8 @@ class ComputeLossAuxOTA:
                 + 3.0 * pair_wise_iou_loss
             )
 
+            cost, dynamic_ks = assignment_cost(
+                cost, pair_wise_iou, cls_scores, self.hyp, self.assign, default_topk=20)
             matching_matrix = torch.zeros_like(cost)
 
             for gt_idx in range(num_gt):
@@ -1392,7 +1396,7 @@ class ComputeLossAuxOTA:
                 )
                 matching_matrix[gt_idx][pos_idx] = 1.0
 
-            del top_k, dynamic_ks
+            del dynamic_ks
             anchor_matching_gt = matching_matrix.sum(0)
             if (anchor_matching_gt > 1).sum() > 0:
                 _, cost_argmin = torch.min(cost[:, anchor_matching_gt > 1], dim=0)
@@ -1510,9 +1514,6 @@ class ComputeLossAuxOTA:
 
             pair_wise_iou_loss = -torch.log(pair_wise_iou + 1e-8)
 
-            top_k, _ = torch.topk(pair_wise_iou, min(20, pair_wise_iou.shape[1]), dim=1)
-            dynamic_ks = torch.clamp(top_k.sum(1).int(), min=1)
-
             gt_cls_per_image = (
                 F.one_hot(this_target[:, 1].to(torch.int64), self.nc)
                 .float()
@@ -1525,6 +1526,7 @@ class ComputeLossAuxOTA:
                 p_cls.float().unsqueeze(0).repeat(num_gt, 1, 1).sigmoid_()
                 * p_obj.unsqueeze(0).repeat(num_gt, 1, 1).sigmoid_()
             )
+            cls_scores = (cls_preds_.detach() * gt_cls_per_image).sum(-1)
 
             y = cls_preds_.sqrt_()
             pair_wise_cls_loss = F.binary_cross_entropy_with_logits(
@@ -1537,6 +1539,8 @@ class ComputeLossAuxOTA:
                 + 3.0 * pair_wise_iou_loss
             )
 
+            cost, dynamic_ks = assignment_cost(
+                cost, pair_wise_iou, cls_scores, self.hyp, self.assign, default_topk=20)
             matching_matrix = torch.zeros_like(cost)
 
             for gt_idx in range(num_gt):
@@ -1545,7 +1549,7 @@ class ComputeLossAuxOTA:
                 )
                 matching_matrix[gt_idx][pos_idx] = 1.0
 
-            del top_k, dynamic_ks
+            del dynamic_ks
             anchor_matching_gt = matching_matrix.sum(0)
             if (anchor_matching_gt > 1).sum() > 0:
                 _, cost_argmin = torch.min(cost[:, anchor_matching_gt > 1], dim=0)

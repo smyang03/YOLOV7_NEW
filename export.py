@@ -14,13 +14,16 @@ from models.experimental import attempt_load, End2End
 from utils.activations import Hardswish, SiLU
 from utils.general import set_logging, check_img_size
 from utils.torch_utils import select_device
-from utils.add_nms import RegisterNMS
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--weights', type=str, default='./yolor-csp-c.pt', help='weights path')
-    parser.add_argument('--img-size', nargs='+', type=int, default=[640, 640], help='image size')  # height, width
-    parser.add_argument('--batch-size', type=int, default=1, help='batch size')
+    parser.add_argument('--img-size', '--img', dest='img_size', nargs='+', type=int, default=[640, 640],
+                        help='image size')  # height, width
+    parser.add_argument('--batch-size', '--batch', dest='batch_size', type=int, default=1, help='batch size')
+    parser.add_argument('--opset', type=int, default=16, help='ONNX opset version')
+    parser.add_argument('--nms-mode', choices=['none', 'end2end'], default='none',
+                        help='ONNX NMS mode. none exports raw model output.')
     parser.add_argument('--dynamic', action='store_true', help='dynamic ONNX axes')
     parser.add_argument('--dynamic-batch', action='store_true', help='dynamic batch onnx for tensorrt and onnx-runtime')
     parser.add_argument('--grid', action='store_true', help='export Detect() layer grid')
@@ -36,6 +39,9 @@ if __name__ == '__main__':
     parser.add_argument('--int8', action='store_true', help='CoreML INT8 quantization')
     parser.add_argument('--gopnms', action='store_true', help='CoreML INT8 quantization')
     opt = parser.parse_args()
+    if opt.nms_mode == 'end2end':
+        opt.end2end = True
+        opt.grid = True
     opt.img_size *= 2 if len(opt.img_size) == 1 else 1  # expand
     opt.dynamic = opt.dynamic and not opt.end2end
     opt.dynamic = False if opt.dynamic_batch else opt.dynamic
@@ -157,7 +163,7 @@ if __name__ == '__main__':
             else:
                 model.model[-1].concat = True
 
-        torch.onnx.export(model, img, f, verbose=False, opset_version=12, input_names=['images'],
+        torch.onnx.export(model, img, f, verbose=False, opset_version=opt.opset, input_names=['images'],
                           output_names=output_names,
                           dynamic_axes=dynamic_axes)
 
@@ -195,6 +201,8 @@ if __name__ == '__main__':
 
         if opt.include_nms:
             print('Registering NMS plugin for ONNX...')
+            from utils.add_nms import RegisterNMS
+
             mo = RegisterNMS(f)
             mo.register_nms()
             mo.save(f)

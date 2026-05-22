@@ -1,5 +1,13 @@
 # 1.3.3 Code-Level Development Requirements
 
+## 공통 예외 사항 - 원 코드 유지 개발
+
+- 본 차수의 새 기능은 기본값으로 비활성화한다. 플래그를 켜지 않으면 기존 YOLOv7 학습, 평가, export 동작이 유지되어야 한다.
+- 기존 함수/클래스는 버그 수정, 호환성 보강, 공통 helper 호출 연결에 한해서만 직접 수정한다.
+- 신규 기능은 가능한 `utils/*`, `models/*`의 새 helper/class/wrapper로 분리하고, 기존 entrypoint는 기존 CLI와 출력 경로를 유지한다.
+- `train.py`, `train_aux.py`, `test.py`, `export.py`는 기존 옵션명을 삭제하지 않는다. alias를 추가할 때도 기존 `dest`와 결과 파일명을 바꾸지 않는다.
+- `train_aux.py`는 즉시 삭제하거나 대체하지 않는다. 공통 helper를 먼저 만들고 AUX/W6 smoke 검증 후 얇은 wrapper로 축소한다.
+
 ## 1.3.3.1 코드 구현 상세
 
 이 세부 항목은 기존 `utils/loss.py`, `utils/loss_aux.py`, `models/yolo.py` 구조를 유지하면서 head/loss/assignment를 플래그 기반으로 추가하는 내부 설계를 고정한다.
@@ -258,3 +266,45 @@ PhaseState를 기준으로 아래 값을 적용한다.
 | `1.3.3-P5` | 누적 A 적용 및 fallback | A smoke, profile/export/fallback log 검증 |
 
 `P2`의 Decoupled Head는 `Detect`, `IDetect`, `IAuxDetect` 중 실제 cfg가 쓰는 module부터 구현한다. 사용하지 않는 head 타입까지 한 PR에서 모두 완성하려고 하지 않는다.
+
+## 11. 1.3.3 구현 반영 현황
+
+### 11.1 코드 반영 파일
+
+| 영역 | 파일 | 반영 내용 |
+| --- | --- | --- |
+| CLI/학습 연결 | `train.py`, `train_aux.py` | `--head`, `--loss-box`, `--assign`, `--loss-cls` 추가, `vfl + simota` 금지 검증, hyp/opt/checkpoint/stage result 저장 |
+| Head | `models/yolo.py` | `DecoupledDetect`, `DecoupledAuxDetect` 추가. 기본 cfg 파일은 유지하고 `--head decoupled` 실행 시 메모리상의 마지막 head만 치환 |
+| WIoU | `utils/wiou.py`, `utils/loss_components.py` | WIoU running mean state, checkpoint 저장/복원 helper 추가 |
+| TAL/VFL | `utils/tal.py`, `utils/loss_components.py`, `utils/loss.py`, `utils/loss_aux.py` | TAL top-k assignment cost와 VFL classification loss 추가. 기존 SimOTA/BCE는 기본값 유지 |
+| AUX device | `utils/loss_aux.py` | `matching_matrix` CPU 강제 생성 제거 |
+| 로그 | `utils/train_logger.py` | `positive_count`, `assigner`, `loss_box`, `loss_cls`, `head` 컬럼 기록 |
+| 검증 도구 | `tools/check_loss_smoke.py` | dummy batch forward/loss/backward smoke 추가 |
+
+재검토 반영:
+- WIoU running mean은 `torch.is_grad_enabled()`일 때만 갱신한다. validation loss 계산은 state를 바꾸지 않아야 한다.
+- Decoupled checkpoint yaml에는 `head_base_module`을 저장한다. 이후 `--head coupled` 요청 시 원래 `IDetect`, `Detect`, `IAuxDetect`로 복원 가능해야 한다.
+- `tools/check_loss_smoke.py --empty-targets`로 target 없는 batch를 검증한다.
+
+### 11.2 현재 통과한 smoke
+
+```bash
+python tools/check_loss_smoke.py --cfg cfg/training/yolov7.yaml --device cpu --img 64 --batch 1 --head coupled --loss-box ciou --assign simota --loss-cls bce
+python tools/check_loss_smoke.py --cfg cfg/training/yolov7.yaml --device cpu --img 64 --batch 1 --head coupled --loss-box wiou_v3 --assign simota --loss-cls bce
+python tools/check_loss_smoke.py --cfg cfg/training/yolov7.yaml --device cpu --img 64 --batch 1 --head coupled --loss-box ciou --assign tal --loss-cls vfl
+python tools/check_loss_smoke.py --cfg cfg/training/yolov7.yaml --device cpu --img 64 --batch 1 --head decoupled --loss-box wiou_v3 --assign tal --loss-cls vfl
+python tools/check_loss_smoke.py --cfg cfg/training/yolov7-w6.yaml --device cpu --img 128 --batch 1 --head decoupled --loss-box wiou_v3 --assign tal --loss-cls vfl
+python tools/check_loss_smoke.py --cfg cfg/training/yolov7.yaml --device cpu --img 64 --batch 1 --head decoupled --loss-box wiou_v3 --assign tal --loss-cls vfl --empty-targets
+python tools/check_loss_smoke.py --cfg cfg/training/yolov7-w6.yaml --device cpu --img 128 --batch 1 --head decoupled --loss-box wiou_v3 --assign tal --loss-cls vfl --empty-targets
+```
+
+W6 smoke는 `img=64, batch=1`에서 BatchNorm 입력이 `1x1`이 되어 실패하므로 `img=128` 이상으로 확인한다. 이는 구현 오류가 아니라 CPU dummy smoke 크기 조건이다.
+
+### 11.3 다음 학습 검증 순서
+
+1. A1: `--head decoupled --loss-box ciou --assign simota --loss-cls bce`
+2. A2: `--head coupled --loss-box wiou_v3 --assign simota --loss-cls bce`
+3. A3: `--head coupled --loss-box ciou --assign tal --loss-cls vfl`
+4. A: `--head decoupled --loss-box wiou_v3 --assign tal --loss-cls vfl`
+
+각 run은 `loss_detail.csv`의 `positive_count`, `assigner`, `loss_box`, `loss_cls`, `head`를 먼저 비교한다. COCO128 1차 테스트에서는 mAP보다 NaN/Inf, positive count 급변, loss scale 폭주 여부를 우선 판정한다.

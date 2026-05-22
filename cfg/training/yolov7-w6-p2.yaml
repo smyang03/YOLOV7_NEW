@@ -1,0 +1,4 @@
+# YOLOv7-W6 1.3.5 D2: P2 anchor-head experiment.
+base: yolov7-w6.yaml
+p2_head: anchor
+neck_mod: none

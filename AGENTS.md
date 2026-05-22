@@ -1,5 +1,9 @@
 # Repository Guidelines
 
+## 원 코드 유지 개발 원칙
+
+기본 실행 경로는 기존 YOLOv7 동작을 유지합니다. 새 기능은 플래그, helper, wrapper, 신규 모듈로 추가하고, 플래그를 켜지 않으면 기존 학습, 평가, export 결과와 CLI 호환이 유지되어야 합니다. 기존 함수나 클래스는 버그 수정, 호환성 보강, 공통 helper 연결에 한해서만 직접 수정합니다. `train.py`, `train_aux.py`, `test.py`, `export.py`의 기존 옵션명과 산출물 경로를 삭제하거나 의미 변경하지 않습니다. `train_aux.py`는 즉시 삭제하지 않고 공통 helper 검증 후 얇은 wrapper로 축소합니다.
+
 ## 프로젝트 구조 및 모듈 구성
 
 이 저장소는 YOLOv7 기반의 학습, 평가, 추론, export 프로젝트입니다.

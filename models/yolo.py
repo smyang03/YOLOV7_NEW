@@ -2,6 +2,9 @@ import argparse
 import logging
 import sys
 from copy import deepcopy
+from pathlib import Path
+
+import yaml
 
 sys.path.append('./')  # to run '$ python *.py' files in subdirectories
 logger = logging.getLogger(__name__)
@@ -18,6 +21,89 @@ try:
     import thop  # for FLOPS computation
 except ImportError:
     thop = None
+
+
+ROOT = Path(__file__).resolve().parents[1]
+P2_ANCHORS = [7, 10, 11, 18, 19, 14]
+
+
+def _resolve_yaml_path(path, parent):
+    p = Path(path)
+    if p.is_absolute() and p.is_file():
+        return p
+    candidates = [parent / p, ROOT / p, Path(path)]
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    return Path(check_file(str(path)))
+
+
+def _apply_scdown(d):
+    for layer in d.get('head', []):
+        module = layer[2]
+        args = layer[3]
+        if module == 'Conv' and len(args) >= 3 and args[1:3] == [3, 2] and args[0] in (128, 256, 384, 512):
+            layer[2] = 'SCDown'
+
+
+def _p2_training_head():
+    base = load_model_yaml(ROOT / 'cfg/training/yolov7-w6.yaml')['head'][:-1]
+    return base + [
+        [83, 1, 'Conv', [32, 1, 1]],  # 122
+        [-1, 1, 'nn.Upsample', [None, 2, 'nearest']],
+        [10, 1, 'Conv', [32, 1, 1]],
+        [[-1, -2], 1, 'Concat', [1]],
+        [-1, 1, 'Conv', [64, 1, 1]],
+        [-1, 1, 'Conv', [64, 1, 1]],  # 127 main P2
+        [-2, 1, 'Conv', [64, 1, 1]],  # 128 aux P2
+        [[127, 114, 115, 116, 117, 128, 118, 119, 120, 121], 1, 'IAuxDetect', ['nc', 'anchors']],
+    ]
+
+
+def _p2_deploy_head():
+    base = load_model_yaml(ROOT / 'cfg/deploy/yolov7-w6.yaml')['head'][:-1]
+    return base + [
+        [83, 1, 'Conv', [32, 1, 1]],  # 118
+        [-1, 1, 'nn.Upsample', [None, 2, 'nearest']],
+        [10, 1, 'Conv', [32, 1, 1]],
+        [[-1, -2], 1, 'Concat', [1]],
+        [-1, 1, 'Conv', [64, 1, 1]],
+        [-1, 1, 'Conv', [64, 1, 1]],  # 123 main P2
+        [[123, 114, 115, 116, 117], 1, 'Detect', ['nc', 'anchors']],
+    ]
+
+
+def _apply_p2_head(d):
+    anchors = d.get('anchors', [])
+    if isinstance(anchors, list) and len(anchors) == 4:
+        d['anchors'] = [P2_ANCHORS] + anchors
+    elif not (isinstance(anchors, list) and len(anchors) == 5):
+        raise ValueError('P2 head requires 4 baseline anchors or 5 explicit anchors')
+    final_module = d.get('head', [])[-1][2]
+    d['head'] = _p2_training_head() if final_module == 'IAuxDetect' else _p2_deploy_head()
+
+
+def load_model_yaml(cfg):
+    cfg_path = _resolve_yaml_path(cfg, ROOT)
+    with open(cfg_path, encoding='utf-8') as f:
+        data = yaml.load(f, Loader=yaml.SafeLoader)
+    if not isinstance(data, dict) or 'base' not in data:
+        return data
+
+    base_path = _resolve_yaml_path(data['base'], cfg_path.parent)
+    base = load_model_yaml(base_path)
+    merged = deepcopy(base)
+    for key, value in data.items():
+        if key not in ('base', 'p2_head', 'neck_mod'):
+            merged[key] = value
+    if data.get('p2_head') == 'anchor':
+        _apply_p2_head(merged)
+    if data.get('neck_mod') == 'scdown':
+        _apply_scdown(merged)
+    merged['cfg_base'] = str(base_path)
+    merged['p2_head'] = data.get('p2_head', 'none')
+    merged['neck_mod'] = data.get('neck_mod', 'none')
+    return merged
 
 
 class Detect(nn.Module):
@@ -92,6 +178,57 @@ class Detect(nn.Module):
                                            device=z.device)
         box @= convert_matrix                          
         return (box, score)
+
+
+class DecoupledOutput(nn.Module):
+    def __init__(self, c1, na, nc):
+        super().__init__()
+        self.na = na
+        self.nc = nc
+        self.no = nc + 5
+        self.box = nn.Conv2d(c1, na * 4, 1)
+        self.obj = nn.Conv2d(c1, na, 1)
+        self.cls = nn.Conv2d(c1, na * nc, 1)
+
+    def forward(self, x):
+        bs, _, ny, nx = x.shape
+        box = self.box(x).view(bs, self.na, 4, ny, nx)
+        obj = self.obj(x).view(bs, self.na, 1, ny, nx)
+        cls = self.cls(x).view(bs, self.na, self.nc, ny, nx)
+        return torch.cat((box, obj, cls), 2).view(bs, self.na * self.no, ny, nx)
+
+    def initialize_biases(self, stride, cf=None):
+        b_obj = self.obj.bias.view(self.na, -1)
+        b_obj.data[:, 0] += math.log(8 / (640 / stride) ** 2)
+        self.obj.bias = torch.nn.Parameter(b_obj.view(-1), requires_grad=True)
+
+        b_cls = self.cls.bias.view(self.na, -1)
+        b_cls.data += math.log(0.6 / (self.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())
+        self.cls.bias = torch.nn.Parameter(b_cls.view(-1), requires_grad=True)
+
+
+class DecoupledDetect(Detect):
+    stride = None
+    export = False
+    end2end = False
+    include_nms = False
+    concat = False
+
+    def __init__(self, nc=80, anchors=(), ch=()):
+        nn.Module.__init__(self)
+        self.nc = nc
+        self.no = nc + 5
+        self.nl = len(anchors)
+        self.na = len(anchors[0]) // 2
+        self.grid = [torch.zeros(1)] * self.nl
+        a = torch.tensor(anchors).float().view(self.nl, -1, 2)
+        self.register_buffer('anchors', a)
+        self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))
+        self.m = nn.ModuleList(DecoupledOutput(x, self.na, self.nc) for x in ch)
+
+    def initialize_biases(self, cf=None):
+        for mi, s in zip(self.m, self.stride):
+            mi.initialize_biases(s, cf)
 
 
 class IDetect(nn.Module):
@@ -325,6 +462,8 @@ class IAuxDetect(nn.Module):
         a = torch.tensor(anchors).float().view(self.nl, -1, 2)
         self.register_buffer('anchors', a)  # shape(nl,na,2)
         self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))  # shape(nl,1,na,1,1,2)
+        if len(ch) != self.nl * 2:
+            raise ValueError(f'IAuxDetect expects {self.nl * 2} input features, got {len(ch)}')
         self.m = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch[:self.nl])  # output conv
         self.m2 = nn.ModuleList(nn.Conv2d(x, self.no * self.na, 1) for x in ch[self.nl:])  # output conv
         
@@ -430,6 +569,68 @@ class IAuxDetect(nn.Module):
         return (box, score)
 
 
+class DecoupledAuxDetect(nn.Module):
+    stride = None
+    export = False
+    end2end = False
+    include_nms = False
+    concat = False
+
+    def __init__(self, nc=80, anchors=(), ch=()):
+        super().__init__()
+        self.nc = nc
+        self.no = nc + 5
+        self.nl = len(anchors)
+        self.na = len(anchors[0]) // 2
+        self.grid = [torch.zeros(1)] * self.nl
+        a = torch.tensor(anchors).float().view(self.nl, -1, 2)
+        self.register_buffer('anchors', a)
+        self.register_buffer('anchor_grid', a.clone().view(self.nl, 1, -1, 1, 1, 2))
+        if len(ch) != self.nl * 2:
+            raise ValueError(f'DecoupledAuxDetect expects {self.nl * 2} input features, got {len(ch)}')
+        self.m = nn.ModuleList(DecoupledOutput(x, self.na, self.nc) for x in ch[:self.nl])
+        self.m2 = nn.ModuleList(DecoupledOutput(x, self.na, self.nc) for x in ch[self.nl:])
+
+    def initialize_biases(self, cf=None):
+        for mi, mi2, s in zip(self.m, self.m2, self.stride):
+            mi.initialize_biases(s, cf)
+            mi2.initialize_biases(s, cf)
+
+    def forward(self, x):
+        z = []
+        self.training |= self.export
+        for i in range(self.nl):
+            x[i] = self.m[i](x[i])
+            bs, _, ny, nx = x[i].shape
+            x[i] = x[i].view(bs, self.na, self.no, ny, nx).permute(0, 1, 3, 4, 2).contiguous()
+
+            x[i + self.nl] = self.m2[i](x[i + self.nl])
+            bs2, _, ny2, nx2 = x[i + self.nl].shape
+            x[i + self.nl] = x[i + self.nl].view(
+                bs2, self.na, self.no, ny2, nx2).permute(0, 1, 3, 4, 2).contiguous()
+
+            if not self.training:
+                if self.grid[i].shape[2:4] != x[i].shape[2:4]:
+                    self.grid[i] = self._make_grid(nx, ny).to(x[i].device)
+                y = x[i].sigmoid()
+                if not torch.onnx.is_in_onnx_export():
+                    y[..., 0:2] = (y[..., 0:2] * 2. - 0.5 + self.grid[i]) * self.stride[i]
+                    y[..., 2:4] = (y[..., 2:4] * 2) ** 2 * self.anchor_grid[i]
+                else:
+                    xy, wh, conf = y.split((2, 2, self.nc + 1), 4)
+                    xy = xy * (2. * self.stride[i]) + (self.stride[i] * (self.grid[i] - 0.5))
+                    wh = wh ** 2 * (4 * self.anchor_grid[i].data)
+                    y = torch.cat((xy, wh, conf), 4)
+                z.append(y.view(bs, -1, self.no))
+
+        return x if self.training else (torch.cat(z, 1), x[:self.nl])
+
+    @staticmethod
+    def _make_grid(nx=20, ny=20):
+        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
+        return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
+
+
 class IBin(nn.Module):
     stride = None  # strides computed during build
     export = False  # onnx export
@@ -506,16 +707,15 @@ class IBin(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, cfg='yolor-csp-c.yaml', ch=3, nc=None, anchors=None):  # model, input channels, number of classes
+    def __init__(self, cfg='yolor-csp-c.yaml', ch=3, nc=None, anchors=None, head='coupled'):  # model, input channels, number of classes
         super(Model, self).__init__()
         self.traced = False
+        self.head = head
         if isinstance(cfg, dict):
-            self.yaml = cfg  # model dict
+            self.yaml = deepcopy(cfg)  # model dict
         else:  # is *.yaml
-            import yaml  # for torch hub
             self.yaml_file = Path(cfg).name
-            with open(cfg) as f:
-                self.yaml = yaml.load(f, Loader=yaml.SafeLoader)  # model dict
+            self.yaml = load_model_yaml(cfg)  # model dict
 
         # Define model
         ch = self.yaml['ch'] = self.yaml.get('ch', ch)  # input channels
@@ -525,6 +725,7 @@ class Model(nn.Module):
         if anchors:
             logger.info(f'Overriding model.yaml anchors with anchors={anchors}')
             self.yaml['anchors'] = round(anchors)  # override yaml value
+        self._apply_head_override(head)
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
         # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
@@ -547,9 +748,9 @@ class Model(nn.Module):
             self.stride = m.stride
             self._initialize_biases()  # only run once
             # print('Strides: %s' % m.stride.tolist())
-        if isinstance(m, IAuxDetect):
+        if isinstance(m, (IAuxDetect, DecoupledAuxDetect)):
             s = 256  # 2x min stride
-            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))[:4]])  # forward
+            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))[:m.nl]])  # forward
             #print(m.stride)
             check_anchor_order(m)
             m.anchors /= m.stride.view(-1, 1, 1)
@@ -577,6 +778,40 @@ class Model(nn.Module):
         initialize_weights(self)
         self.info()
         logger.info('')
+
+    def _apply_head_override(self, head):
+        if head == 'coupled':
+            base_module = self.yaml.get('head_base_module')
+            if base_module:
+                for layer in reversed(self.yaml.get('head', [])):
+                    module = layer[2]
+                    module_name = module if isinstance(module, str) else getattr(module, '__name__', str(module))
+                    if module_name in ('DecoupledDetect', 'DecoupledAuxDetect'):
+                        layer[2] = base_module
+                        self.yaml['head_type'] = 'coupled'
+                        logger.info(f'Restored coupled head override: {base_module}')
+                        return
+            return
+        if head != 'decoupled':
+            raise ValueError(f'Unsupported head option: {head}')
+        for layer in reversed(self.yaml.get('head', [])):
+            module = layer[2]
+            module_name = module if isinstance(module, str) else getattr(module, '__name__', str(module))
+            if module_name in ('Detect', 'IDetect', 'DecoupledDetect'):
+                base_module = self.yaml.get('head_base_module') or ('Detect' if module_name == 'DecoupledDetect' else module_name)
+                layer[2] = 'DecoupledDetect'
+                self.yaml['head_type'] = 'decoupled'
+                self.yaml['head_base_module'] = base_module
+                logger.info('Using DecoupledDetect head override')
+                return
+            if module_name in ('IAuxDetect', 'DecoupledAuxDetect'):
+                base_module = self.yaml.get('head_base_module') or ('IAuxDetect' if module_name == 'DecoupledAuxDetect' else module_name)
+                layer[2] = 'DecoupledAuxDetect'
+                self.yaml['head_type'] = 'decoupled'
+                self.yaml['head_base_module'] = base_module
+                logger.info('Using DecoupledAuxDetect head override')
+                return
+        raise ValueError('--head decoupled requires a Detect, IDetect, or IAuxDetect module in model yaml')
 
     def forward(self, x, augment=False, profile=False):
         if augment:
@@ -608,11 +843,11 @@ class Model(nn.Module):
                 self.traced=False
 
             if self.traced:
-                if isinstance(m, Detect) or isinstance(m, IDetect) or isinstance(m, IAuxDetect) or isinstance(m, IKeypoint):
+                if isinstance(m, Detect) or isinstance(m, IDetect) or isinstance(m, IAuxDetect) or isinstance(m, DecoupledAuxDetect) or isinstance(m, IKeypoint):
                     break
 
             if profile:
-                c = isinstance(m, (Detect, IDetect, IAuxDetect, IBin))
+                c = isinstance(m, (Detect, IDetect, IAuxDetect, DecoupledAuxDetect, IBin))
                 o = thop.profile(m, inputs=(x.copy() if c else x,), verbose=False)[0] / 1E9 * 2 if thop else 0  # FLOPS
                 for _ in range(10):
                     m(x.copy() if c else x)
@@ -634,6 +869,9 @@ class Model(nn.Module):
         # https://arxiv.org/abs/1708.02002 section 3.3
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
         m = self.model[-1]  # Detect() module
+        if hasattr(m, 'initialize_biases'):
+            m.initialize_biases(cf)
+            return
         for mi, s in zip(m.m, m.stride):  # from
             b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
             b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
@@ -644,6 +882,9 @@ class Model(nn.Module):
         # https://arxiv.org/abs/1708.02002 section 3.3
         # cf = torch.bincount(torch.tensor(np.concatenate(dataset.labels, 0)[:, 0]).long(), minlength=nc) + 1.
         m = self.model[-1]  # Detect() module
+        if hasattr(m, 'initialize_biases'):
+            m.initialize_biases(cf)
+            return
         for mi, mi2, s in zip(m.m, m.m2, m.stride):  # from
             b = mi.bias.view(m.na, -1)  # conv.bias(255) to (3,85)
             b.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
@@ -749,7 +990,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                 pass
 
         n = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        if m in [nn.Conv2d, Conv, RobustConv, RobustConv2, DWConv, GhostConv, RepConv, RepConv_OREPA, DownC, 
+        if m in [nn.Conv2d, Conv, SCDown, RobustConv, RobustConv2, DWConv, GhostConv, RepConv, RepConv_OREPA, DownC,
                  SPP, SPPF, SPPCSPC,SPPFCSPC,GhostSPPCSPC, MixConv2d, Focus, Stem, GhostStem, CrossConv, 
                  Bottleneck, BottleneckCSPA, BottleneckCSPB, BottleneckCSPC, 
                  RepBottleneck, RepBottleneckCSPA, RepBottleneckCSPB, RepBottleneckCSPC,  
@@ -787,7 +1028,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             c2 = ch[f[0]]
         elif m is Foldcut:
             c2 = ch[f] // 2
-        elif m in [Detect, IDetect, IAuxDetect, IBin, IKeypoint]:
+        elif m in [Detect, IDetect, IAuxDetect, DecoupledDetect, DecoupledAuxDetect, IBin, IKeypoint]:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)

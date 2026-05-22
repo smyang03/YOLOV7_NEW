@@ -1,5 +1,13 @@
 # 1.3.2 Code-Level Development Requirements
 
+## 공통 예외 사항 - 원 코드 유지 개발
+
+- 본 차수의 새 기능은 기본값으로 비활성화한다. 플래그를 켜지 않으면 기존 YOLOv7 학습, 평가, export 동작이 유지되어야 한다.
+- 기존 함수/클래스는 버그 수정, 호환성 보강, 공통 helper 호출 연결에 한해서만 직접 수정한다.
+- 신규 기능은 가능한 `utils/*`, `models/*`의 새 helper/class/wrapper로 분리하고, 기존 entrypoint는 기존 CLI와 출력 경로를 유지한다.
+- `train.py`, `train_aux.py`, `test.py`, `export.py`는 기존 옵션명을 삭제하지 않는다. alias를 추가할 때도 기존 `dest`와 결과 파일명을 바꾸지 않는다.
+- `train_aux.py`는 즉시 삭제하거나 대체하지 않는다. 공통 helper를 먼저 만들고 AUX/W6 smoke 검증 후 얇은 wrapper로 축소한다.
+
 ## 1.3.2.1 코드 구현 상세
 
 이 세부 항목은 `train.py`와 `train_aux.py`를 바로 합치기 전에 공통 helper, phase 계산, logger, dataloader rebuild의 내부 구조를 고정한다.
@@ -71,6 +79,18 @@ Phase 2 또는 Phase 3 최초 진입 시 아래 순서로 처리한다.
 6. `phase_transition.log`에 rebuild 결과 기록
 
 부모 dataset의 `dataset.mosaic = False`만 바꾸는 방식은 허용하지 않는다. `persistent_workers`는 `workers=0` 또는 close mosaic 구간에서 꺼야 한다.
+
+### Rectangular Mosaic 구현 규칙
+
+기존 YOLOv7 기본 동작은 유지한다. 일반 `--rect`만 켠 경우에는 기존처럼 mosaic을 끈다. 단, Phase 2처럼 `--phase-train on`, `--phase2-rect`, `--phase2-mosaic on`이 모두 명시된 경우에는 rectangular mosaic을 허용한다.
+
+Rectangular mosaic은 batch별 `self.batch_shapes[self.batch[index]]`를 target shape로 사용한다. 4-mosaic canvas는 `2H x 2W`로 만들고, `random_perspective(..., border=(-H//2, -W//2))`를 적용해 최종 image shape가 같은 batch 안에서 항상 `H x W`가 되게 한다. Rectangular mosaic 경로에서는 9-mosaic을 쓰지 않고 4-mosaic만 사용한다. label/segment clip은 width와 height를 분리해 적용한다.
+
+검증 기준:
+- `rect=False, mosaic=True`: 기존 square mosaic 유지
+- `rect=True, allow_rect_mosaic=False`: 기존처럼 mosaic off
+- `rect=True, allow_rect_mosaic=True`: batch output shape가 `batch_shapes`와 일치
+- Phase 3 또는 close mosaic: 새 Dataset 생성 후 mosaic off
 
 ### logger schema
 

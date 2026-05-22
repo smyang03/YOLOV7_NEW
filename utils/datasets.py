@@ -30,6 +30,9 @@ import urllib.parse
 
 from utils.general import check_requirements, xyxy2xywh, xywh2xyxy, xywhn2xyxy, xyn2xy, segment2box, segments2boxes, \
     resample_segments, clean_str
+from utils.augment_policy import AugmentPolicy
+from utils.cctv_augmentations import apply_cctv_augmentations, load_hard_negative_manifest
+from utils.sampler import build_weighted_sampler
 from utils.torch_utils import torch_distributed_zero_first
 
 # Parameters
@@ -63,7 +66,13 @@ def exif_size(img):
 
     return s
 def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=False, cache=False, pad=0.0, rect=False,
-                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='', close_mosaic=False):
+                      rank=-1, world_size=1, workers=8, image_weights=False, quad=False, prefix='',
+                      close_mosaic=False, force_mosaic_off=False, allow_rect_mosaic=False, aug_phase=None):
+    sampler_mode = getattr(opt, 'sampler_mode', 'off') if augment else 'off'
+    sampler_mode = 'off' if sampler_mode == 'none' else sampler_mode
+    if rect and sampler_mode == 'weighted':
+        logger.info(f'{prefix}Disabling rectangular batches for --sampler-mode weighted')
+        rect = False
     # Make sure only the first process in DDP process the dataset first, and the following others can use the cache
     with torch_distributed_zero_first(rank):
         dataset = LoadImagesAndLabels(path, imgsz, batch_size,
@@ -76,12 +85,24 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                                       pad=pad,
                                       image_weights=image_weights,
                                       prefix=prefix,
-                                      close_mosaic=close_mosaic)  # close_mosaic 매개변수 추가
+                                      close_mosaic=close_mosaic,
+                                      force_mosaic_off=force_mosaic_off,
+                                      allow_rect_mosaic=allow_rect_mosaic,
+                                      aug_profile=getattr(opt, 'aug_profile', 'off'),
+                                      aug_phase=aug_phase,
+                                      hard_negative_manifest=getattr(opt, 'hard_negative_manifest', ''))
 
     batch_size = min(batch_size, len(dataset))
     nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
-    sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
-    loader = torch.utils.data.DataLoader if image_weights or close_mosaic else InfiniteDataLoader
+    if sampler_mode == 'weighted':
+        if image_weights:
+            raise ValueError('--sampler-mode weighted cannot be used with --image-weights')
+        nc = int(getattr(opt, 'nc', 0) or max((x[:, 0].max() if len(x) else 0 for x in dataset.labels), default=0) + 1)
+        sampler = build_weighted_sampler(dataset, nc, rank=rank, world_size=world_size, seed=getattr(opt, 'seed', 0), hyp=hyp)
+    else:
+        sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
+    loader = torch.utils.data.DataLoader if image_weights or close_mosaic or sampler_mode == 'weighted' else InfiniteDataLoader
+    persistent_workers = nw > 0 and not close_mosaic
     
     # Use torch.utils.data.DataLoader() if dataset.properties will update during training else InfiniteDataLoader()
     dataloader = loader(dataset,
@@ -89,7 +110,7 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
                         num_workers=nw,
                         sampler=sampler,
                         pin_memory=True,
-                        persistent_workers=True,
+                        persistent_workers=persistent_workers,
                         collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
     return dataloader, dataset
 
@@ -522,25 +543,49 @@ class LoadStreams:  # multiple IP or RTSP cameras
 
 def img2label_paths(img_paths):
     # Define label paths as a function of image paths
-    sa, sb = os.sep + 'JPEGImages' + os.sep, os.sep + 'labels' + os.sep  # /images/, /labels/ substrings
-    return ['txt'.join(x.replace(sa, sb, 1).rsplit(x.split('.')[-1], 1)) for x in img_paths]
+    replacements = (
+        (os.sep + 'images' + os.sep, os.sep + 'labels' + os.sep),
+        (os.sep + 'JPEGImages' + os.sep, os.sep + 'labels' + os.sep),
+        ('/images/', '/labels/'),
+        ('/JPEGImages/', '/labels/'),
+        ('\\images\\', '\\labels\\'),
+        ('\\JPEGImages\\', '\\labels\\'),
+    )
+    label_paths = []
+    for x in img_paths:
+        x = str(x)
+        for sa, sb in replacements:
+            if sa in x:
+                x = x.replace(sa, sb, 1)
+                break
+        label_paths.append(str(Path(x).with_suffix('.txt')))
+    return label_paths
 
 
 class LoadImagesAndLabels(Dataset):
     def __init__(self, path, img_size=640, batch_size=16, augment=False, hyp=None, rect=False, 
-                 image_weights=False, cache_images=False, single_cls=False, stride=32, pad=0.0, 
-                 prefix='', close_mosaic=False):  # 새 파라미터 추가
+                 image_weights=False, cache_images=False, single_cls=False, stride=32, pad=0.0,
+                 prefix='', close_mosaic=False, force_mosaic_off=False, allow_rect_mosaic=False,
+                 aug_profile='off', aug_phase=None, hard_negative_manifest=''):
         
         self.img_size = img_size
         self.augment = augment
         self.hyp = hyp
         self.image_weights = image_weights
         self.rect = False if image_weights else rect
-        self.mosaic = self.augment and not self.rect  # 모자이크 활성화 조건
+        self.allow_rect_mosaic = allow_rect_mosaic
+        self.mosaic = self.augment and (not self.rect or self.allow_rect_mosaic) and not force_mosaic_off
         self.mosaic_border = [-img_size // 2, -img_size // 2]
         self.stride = stride
         self.path = path
         self.close_mosaic = close_mosaic  # 새로 추가
+        profile = aug_profile if augment else 'off'
+        self.augment_policy = AugmentPolicy.from_config(profile, aug_phase, self.hyp)
+        self.aug_stats = {}
+        self.hard_negative_crops = (
+            load_hard_negative_manifest(hard_negative_manifest)
+            if self.augment_policy.profile == 'cctv_paste' else []
+        )
         #self.albumentations = Albumentations() if augment else None
 
         try:
@@ -582,9 +627,15 @@ class LoadImagesAndLabels(Dataset):
         self.label_files = img2label_paths(self.img_files)  # labels
         cache_path = (p if p.is_file() else Path(self.label_files[0]).parent).with_suffix('.cache')  # cached labels
         if cache_path.is_file():
-            cache, exists = torch.load(cache_path), True  # load
-            #if cache['hash'] != get_hash(self.label_files + self.img_files) or 'version' not in cache:  # changed
-            #    cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
+            try:
+                cache, exists = torch.load(cache_path), True  # load
+                cache_hash = cache.get('hash')
+                cache_version = cache.get('version')
+                current_hash = get_hash(self.label_files + self.img_files)
+                if cache_hash != current_hash or cache_version != 0.1:
+                    cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
+            except Exception:
+                cache, exists = self.cache_labels(cache_path, prefix), False  # re-cache
         else:
             cache, exists = self.cache_labels(cache_path, prefix), False  # cache
 
@@ -810,17 +861,18 @@ class LoadImagesAndLabels(Dataset):
         hyp = self.hyp
         mosaic = self.mosaic and random.random() < hyp['mosaic']
         if mosaic:
+            mosaic_shape = self.batch_shapes[self.batch[index]] if self.rect else None
             # Load mosaic
-            if random.random() < 0.8:
-                img, labels = load_mosaic(self, index)
+            if self.rect or random.random() < 0.8:
+                img, labels = load_mosaic(self, index, mosaic_shape)
             else:
                 img, labels = load_mosaic9(self, index)
             shapes = None
 
             # MixUp https://arxiv.org/pdf/1710.09412.pdf
             if random.random() < hyp['mixup']:
-                if random.random() < 0.8:
-                    img2, labels2 = load_mosaic(self, random.randint(0, len(self.labels) - 1))
+                if self.rect or random.random() < 0.8:
+                    img2, labels2 = load_mosaic(self, random.randint(0, len(self.labels) - 1), mosaic_shape)
                 else:
                     img2, labels2 = load_mosaic9(self, random.randint(0, len(self.labels) - 1))
                 r = np.random.beta(8.0, 8.0)  # mixup ratio, alpha=beta=8.0
@@ -855,6 +907,10 @@ class LoadImagesAndLabels(Dataset):
 
             # Augment colorspace
             augment_hsv(img, hgain=hyp['hsv_h'], sgain=hyp['hsv_s'], vgain=hyp['hsv_v'])
+            img, labels, aug_info = apply_cctv_augmentations(
+                img, labels, self.augment_policy, self.hard_negative_crops)
+            for k, v in aug_info.items():
+                self.aug_stats[k] = self.aug_stats.get(k, 0) + int(v)
 
             # Apply cutouts
             # if random.random() < 0.9:
@@ -1002,12 +1058,30 @@ def hist_equalize(img, clahe=True, bgr=False):
     return cv2.cvtColor(yuv, cv2.COLOR_YUV2BGR if bgr else cv2.COLOR_YUV2RGB)  # convert YUV image to RGB
 
 
-def load_mosaic(self, index):
+def _mosaic_target_shape(self, shape=None):
+    if shape is None:
+        return int(self.img_size), int(self.img_size)
+    h, w = [int(x) for x in shape]
+    return h, w
+
+
+def _clip_mosaic_labels(labels, segments, width, height):
+    if len(labels):
+        labels[:, [1, 3]] = labels[:, [1, 3]].clip(0, width)
+        labels[:, [2, 4]] = labels[:, [2, 4]].clip(0, height)
+    for segment in segments:
+        segment[:, 0] = segment[:, 0].clip(0, width)
+        segment[:, 1] = segment[:, 1].clip(0, height)
+
+
+def load_mosaic(self, index, shape=None):
     # loads images in a 4-mosaic
 
     labels4, segments4 = [], []
-    s = self.img_size
-    yc, xc = [int(random.uniform(-x, 2 * s + x)) for x in self.mosaic_border]  # mosaic center x, y
+    mh, mw = _mosaic_target_shape(self, shape)
+    border = (-mh // 2, -mw // 2)
+    yc = int(random.uniform(-border[0], 2 * mh + border[0]))  # mosaic center y
+    xc = int(random.uniform(-border[1], 2 * mw + border[1]))  # mosaic center x
     indices = [index] + random.choices(self.indices, k=3)  # 3 additional image indices
     for i, index in enumerate(indices):
         # Load image
@@ -1015,17 +1089,17 @@ def load_mosaic(self, index):
 
         # place img in img4
         if i == 0:  # top left
-            img4 = np.full((s * 2, s * 2, img.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
+            img4 = np.full((mh * 2, mw * 2, img.shape[2]), 114, dtype=np.uint8)  # base image with 4 tiles
             x1a, y1a, x2a, y2a = max(xc - w, 0), max(yc - h, 0), xc, yc  # xmin, ymin, xmax, ymax (large image)
             x1b, y1b, x2b, y2b = w - (x2a - x1a), h - (y2a - y1a), w, h  # xmin, ymin, xmax, ymax (small image)
         elif i == 1:  # top right
-            x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, s * 2), yc
+            x1a, y1a, x2a, y2a = xc, max(yc - h, 0), min(xc + w, mw * 2), yc
             x1b, y1b, x2b, y2b = 0, h - (y2a - y1a), min(w, x2a - x1a), h
         elif i == 2:  # bottom left
-            x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(s * 2, yc + h)
+            x1a, y1a, x2a, y2a = max(xc - w, 0), yc, xc, min(mh * 2, yc + h)
             x1b, y1b, x2b, y2b = w - (x2a - x1a), 0, w, min(y2a - y1a, h)
         elif i == 3:  # bottom right
-            x1a, y1a, x2a, y2a = xc, yc, min(xc + w, s * 2), min(s * 2, yc + h)
+            x1a, y1a, x2a, y2a = xc, yc, min(xc + w, mw * 2), min(mh * 2, yc + h)
             x1b, y1b, x2b, y2b = 0, 0, min(w, x2a - x1a), min(y2a - y1a, h)
 
         img4[y1a:y2a, x1a:x2a] = img[y1b:y2b, x1b:x2b]  # img4[ymin:ymax, xmin:xmax]
@@ -1042,8 +1116,7 @@ def load_mosaic(self, index):
 
     # Concat/clip labels
     labels4 = np.concatenate(labels4, 0)
-    for x in (labels4[:, 1:], *segments4):
-        np.clip(x, 0, 2 * s, out=x)  # clip when using random_perspective()
+    _clip_mosaic_labels(labels4, segments4, mw * 2, mh * 2)  # clip when using random_perspective()
     # img4, labels4 = replicate(img4, labels4)  # replicate
 
     # Augment
@@ -1056,7 +1129,7 @@ def load_mosaic(self, index):
                                        scale=self.hyp['scale'],
                                        shear=self.hyp['shear'],
                                        perspective=self.hyp['perspective'],
-                                       border=self.mosaic_border)  # border to remove
+                                       border=border)  # border to remove
 
     return img4, labels4
 
