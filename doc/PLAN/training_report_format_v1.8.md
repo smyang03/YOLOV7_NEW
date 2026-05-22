@@ -219,3 +219,108 @@ export_status, risk_level, next_action
 - `재실험`: 조정하면 가능성이 있는 기능
 - `원인`: 문제가 생긴 stage와 가장 가능성 높은 원인
 - `다음 액션`: 바로 실행할 명령 또는 수정할 코드 영역
+
+## 11. 학습 1회 종료 종합 리포트
+
+학습 1회가 끝나면 성공/실패와 관계없이 run 단위 종합 리포트를 Markdown으로 저장한다.
+
+| 실행 형태 | 저장 위치 | 목적 |
+| --- | --- | --- |
+| 단일 학습 | `runs/train/<exp>/run_summary.md` | 해당 학습 1회의 결과, 문제, 다음 액션 정리 |
+| sequence stage | `runs/train_seq/v1.8/<stage>/stage_summary.md` | stage별 keep/drop/retry/blocker 즉시 판정 |
+| 학습 종류별 종합 | `runs/train_seq/v1.8/final_report/<train_type>_summary.md` | 같은 종류의 학습 결과를 L/W6, dataset profile별로 비교 |
+| 최종 통합 | `doc/REPORT/final_training_report_v1.8_YYYY-MM-DD.md` | 전체 개발 항목의 유지/제거/재실험 결론 |
+
+`train_type`은 아래 값 중 하나로 기록한다.
+
+| train_type | 대상 |
+| --- | --- |
+| `baseline_export` | v1.3.1 baseline, label/cache/checkpoint/export 안전성 |
+| `phase_training` | v1.3.2 phase schedule, close-mosaic, dataloader 재구성 |
+| `core_loss_model` | v1.3.3 loss, assignment, head, AUX 안정성 |
+| `augmentation_data` | v1.3.4 mosaic/rect/augmentation/data policy |
+| `model_family_export` | v1.3.5 L/W6/W6-P2/SCDown/PSA/GELAN, ONNX export |
+| `optional_gate` | v1.3.6 optional branch와 fallback |
+| `finetune_distill` | v1.3.7 fine-tuning, class mapping, distillation |
+| `sequence_report` | v1.3.8 stage orchestration과 final report |
+
+## 12. 종합 판정 기준
+
+run 단위 리포트는 아래 순서로 판단한다.
+
+1. 실행 식별: stage id, train_type, model family, dataset profile, seed, 시작 weight, 활성 flag
+2. 산출물 완성도: `best.pt`, `last.pt`, `results.csv`, `loss_detail.csv`, `stage_result.yaml`, export 산출물 존재 여부
+3. 성능 변화: primary mAP, mAP50, precision, recall, class별 AP, small/rare metric
+4. 안정성: NaN/Inf, loss 폭주, positive count 이상, label drop, cache rebuild, warning count
+5. 비용 변화: GFLOPs, parameter count, epoch time, GPU memory, inference latency, NMS time
+6. export 가능성: ONNX 생성 여부, 32배수 입력 검증, output diff, simplify 결과
+7. 문제 원인: `data`, `loader`, `loss`, `assignment`, `architecture`, `export`, `runtime_cost`, `augmentation`, `finetune`
+8. 최종 판정: `keep`, `keep_candidate`, `drop`, `retry_tune`, `blocker`, `defer`
+9. 다음 액션: 다음 stage 진행, flag off, threshold 조정, dataset rebuild, 코드 수정 위치
+
+COCO128 quick run은 성능 개선 결론에 사용하지 않는다. 이 경우 리포트는 crash, 산출물 누락, flag 연결, stage 전환, 리포트 생성이 정상인지에만 초점을 둔다.
+
+target full run은 baseline 대비 성능과 비용을 함께 판단한다. GFLOPs 증가는 기존 모델 대비 최대 10% 미만을 원칙으로 보고, 이를 넘는 기능은 성능 개선이 있더라도 `retry_tune` 또는 `drop` 후보로 둔다.
+
+## 13. run_summary.md 템플릿
+
+```markdown
+# Run Summary - <train_type>
+
+## Decision
+
+- decision:
+- reason:
+- dataset_profile:
+- model_family:
+- start_weight:
+- best_weight:
+- enabled_flags:
+- disabled_flags:
+
+## Artifact Check
+
+| Artifact | Status | Path | Note |
+| --- | --- | --- | --- |
+| best.pt | | | |
+| last.pt | | | |
+| results.csv | | | |
+| loss_detail.csv | | | |
+| stage_result.yaml | | | |
+| export | | | |
+
+## Metric Summary
+
+| Metric | Baseline | Previous | Current | Delta vs Baseline | Delta vs Previous |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| primary_mAP | | | | | |
+| mAP50 | | | | | |
+| precision | | | | | |
+| recall | | | | | |
+| GFLOPs | | | | | |
+| epoch_time | | | | | |
+| inference_ms | | | | | |
+
+## Stability And Risk
+
+- loss_status:
+- label_status:
+- cache_status:
+- export_status:
+- warning_count:
+- failed_category:
+
+## What Changed
+
+- increased:
+- decreased:
+- unchanged:
+- risk:
+
+## Next Action
+
+- next_stage:
+- carry_flags:
+- rollback_flags:
+- code_area:
+```

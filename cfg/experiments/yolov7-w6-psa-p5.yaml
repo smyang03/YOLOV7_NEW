@@ -1,0 +1,5 @@
+# YOLOv7-W6 1.3.6 C2: optional PSA P5-only neck experiment.
+base: ../training/yolov7-w6.yaml
+neck_mod: psa
+psa_level: p5
+p2_head: none

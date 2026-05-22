@@ -26,7 +26,7 @@ DEFAULT_COLUMNS = [
 
 def parse_rows(path):
     rows = []
-    for line in Path(path).read_text(encoding='utf-8').splitlines():
+    for line in Path(path).read_text(encoding='utf-8-sig').splitlines():
         values = [float(x) for x in NUMERIC_RE.findall(line)]
         if values:
             rows.append(values)

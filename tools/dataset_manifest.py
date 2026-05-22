@@ -42,6 +42,10 @@ def resolve_path(value, data_dir, root):
 
 
 def read_image_list(source, data_dir, root):
+    if isinstance(source, dict):
+        source = source.get('path') or source.get('images') or source.get('source')
+        if not source:
+            return []
     if isinstance(source, (list, tuple)):
         images = []
         for item in source:
@@ -102,12 +106,17 @@ def main(opt):
             splits[name] = split_summary(name, data[name], data_dir)
 
     result = {
-        'schema_version': '1.3.1',
+        'schema_version': opt.schema_version,
         'data': str(data_path),
+        'stage': opt.stage,
         'nc': data.get('nc'),
         'names': data.get('names'),
         'splits': splits,
     }
+    aggregate = hashlib.sha256()
+    for split in splits.values():
+        aggregate.update(split['checksum'].encode())
+    result['aggregate_checksum'] = aggregate.hexdigest()
 
     output = Path(opt.output)
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -119,4 +128,6 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--data', type=str, required=True, help='data yaml path')
     parser.add_argument('--output', type=str, required=True, help='dataset_manifest.json output path')
+    parser.add_argument('--schema-version', type=str, default='1.3.1')
+    parser.add_argument('--stage', type=str, default='')
     main(parser.parse_args())

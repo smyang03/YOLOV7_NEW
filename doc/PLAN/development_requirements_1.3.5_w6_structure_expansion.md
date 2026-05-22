@@ -290,12 +290,18 @@ W6 구조 변경은 cfg route/channel 오류가 자주 나는 영역이므로 cf
 - `tools/estimate_nms_cost.py`: Python NMS 입력 box 수와 평균/p95 ms 기록.
 - `tools/check_output_contract.py`: P2 5-level stride, anchor, output box 계약 검증 JSON 생성.
 
+재검토 반영:
+- `load_model_yaml()`은 최상위 cfg도 repo-root 기준으로 resolve한다. 학습 서버에서 다른 작업 디렉터리에서 도구를 호출해도 `cfg/training/...` 경로가 깨지지 않아야 한다.
+- P2+SCDown cfg는 `--head coupled`와 `--head decoupled` 양쪽에서 모두 5-level AUX head로 생성되어야 한다.
+
 검증 결과:
 - `python -m py_compile models/yolo.py models/common.py utils/model_options.py tools/profile_model.py tools/estimate_nms_cost.py tools/check_output_contract.py train.py train_aux.py` 통과.
 - 기본 W6 training cfg: `105.5 GFLOPs`.
 - P2 단독 training cfg: `108.1 GFLOPs`, 기준 대비 약 `+2.46%`.
 - P2+SCDown training cfg: `110.4 GFLOPs`, 기준 대비 약 `+4.66%`.
 - P2 deploy cfg: model build 통과, `stride=[4,8,16,32,64]`, `anchors_shape=[5,3,2]`.
+- P2+SCDown decoupled build 통과: `DecoupledAuxDetect`, `main=5`, `aux=5`.
+- `$env:TEMP`에서 `tools/check_output_contract.py`와 `tools/profile_model.py`를 직접 호출해 cfg resolve 통과.
 - `runs/tmp_135_profile/p2_scdown_output_contract.json`: `status=pass`, `actual_total_boxes=102300`.
 - `runs/tmp_135_profile/p2_scdown_profile.json`: `gflops_delta_percent=4.663865023696678`, `activation_memory_mb=66.34140014648438`.
 - `runs/tmp_135_profile/p2_scdown_nms_cost.json`: `1280x768`, `total_boxes=245520`, CPU `candidate_ratio=0.001`, `mean_nms_ms=2.90165`.

@@ -307,26 +307,43 @@ Phase 계산:
 
 ### 5.3 `stage_result.yaml`
 
-필수 필드:
-- `stage: 1.3.2`
-- `baseline_run`
-- `current_run`
-- `phase_train`
-- `phase_boundaries`
-- `best_epoch`
-- `best_map_50_95`
-- `profile_json`
-- `baseline_gflops`
-- `current_gflops`
-- `gflops_delta_percent`
-- `primary_mAP`
-- `mAP_0.5`
-- `small_AP`
-- `rare_recall`
-- `trt_latency`: `null` 허용, TensorRT runtime 차수 전에는 측정하지 않음
-- `export_check_json`
-- `output_contract_json`
+표준 필드:
+- `schema_version: "1.3"`
+- `stage_id: "1.3.2"`
+- `stage_name: "phase_training"`
+- `train_type: "phase_training"`
+- `decision`: `keep`, `keep_candidate`, `drop`, `retry_tune`, `blocker`, `defer`
+- `reason`
 - `status`
+- `hard_fail`
+- `soft_fail`
+- `failed_category`
+- `metrics.primary_mAP`
+- `metrics.mAP50`
+- `metrics.GFLOPs`
+- `metrics.GFLOPs_delta_percent`
+- `artifacts.results_csv`
+- `artifacts.loss_detail_csv`
+- `artifacts.run_summary`
+- `log_paths.train_log`
+- `log_paths.phase_transition`
+- `log_paths.debug_trace`
+- `log_paths.error_trace`
+
+호환 필드:
+- 기존 `stage`, `baseline_run`, `current_run`, `phase_train`, `phase_boundaries`, `best_epoch`, `best_map_50_95`, `mAP_0.5`, `small_AP`, `rare_recall`, `export_check_json`, `output_contract_json`, `status`는 즉시 제거하지 않고 표준 필드와 함께 유지한다.
+- `trt_latency`는 `null` 허용이며 TensorRT runtime 차수 전에는 측정하지 않는다.
+
+### 5.4 `run_summary.md`
+
+단일 학습 1회가 끝나면 `runs/train/<exp>/run_summary.md`를 저장한다.
+
+필수 섹션:
+- `Decision`: decision, reason, train_type, dataset profile, model family, enabled/disabled flags
+- `Artifact Check`: `best.pt`, `last.pt`, `results.csv`, `loss_detail.csv`, `stage_result.yaml`
+- `Metric Summary`: primary mAP, mAP50, precision, recall, GFLOPs, epoch time
+- `Stability And Risk`: loss status, label/cache status, warning count, failed category
+- `Next Action`: 다음 stage, carry flags, rollback flags, code area
 
 ## 6. 통과 기준
 
@@ -335,24 +352,28 @@ Phase 계산:
 3. `workers>0` smoke 학습이 완료된다.
 4. Phase 2/3 전환은 각각 최초 진입 시 1회만 발생한다.
 5. Phase 3 진입 후 새 Dataset의 `mosaic=False`가 로그로 확인된다.
-6. `results.csv`, `results_per_class.csv`, `loss_detail.csv`, `train_log.txt`, `phase_transition.log`, `hyp_used.yaml`, `stage_result.yaml`이 생성된다.
+6. `results.csv`, `results_per_class.csv`, `loss_detail.csv`, `train_log.txt`, `phase_transition.log`, `hyp_used.yaml`, `stage_result.yaml`, `run_summary.md`가 생성된다.
 7. `results.txt`는 기존 plot 경로를 깨지 않는다.
 8. 1.3.1 export 검증 경로가 계속 통과한다.
 9. `train_aux.py`와 `train.py`의 Phase/DataLoader/checkpoint 로직이 서로 다른 방식으로 중복 구현되지 않는다.
 10. `--aux auto`에서 W6 cfg의 AUX 경로가 자동 선택되고 L cfg는 기본 main loss 경로를 사용한다.
 11. Early stopping은 Phase 1/2에서 동작하지 않고 Phase 3에서만 동작한다.
 12. W6 smoke에서 `grad_accumulate=4`가 적용되고 effective batch가 로그에 기록된다.
+13. `--log-format txt`에서도 최소 `train_log.txt`, `stage_result.yaml`, `run_summary.md`는 생성된다.
+14. `--debug-log error`를 켠 경우 `error_trace.log`가 생성되고 예외 발생 시 JSONL event가 기록된다.
 
 ## 7. 구현 순서
 
 1. `utils/phase.py` 작성 및 boundary dry-run 검증
-2. `utils/train_logger.py` 작성
-3. `train.py`에 Phase CLI와 PhaseState 연결
-4. DataLoader build 함수를 분리하고 Phase rebuild 적용
-5. `train_aux.py` 중복 루프 제거 또는 wrapper화
-6. Phase별 hyp 파일 작성
-7. per-class/loss/detail/plot 산출물 연결
-8. Early stopping Phase 3 전용 정책 연결
+2. `utils/train_logger.py` 작성 및 `stage_result.yaml` 표준 schema 정렬
+3. `run_summary.md` writer 추가
+4. `utils/debug_logging.py` error/debug JSONL writer 추가
+5. `train.py`에 Phase CLI와 PhaseState 연결
+6. DataLoader build 함수를 분리하고 Phase rebuild 적용
+7. `train_aux.py` 중복 루프 제거 또는 wrapper화
+8. Phase별 hyp 파일 작성
+9. per-class/loss/detail/plot 산출물 연결
+10. Early stopping Phase 3 전용 정책 연결
 9. `workers=0`, `workers>0` smoke 실행
 10. `results.csv`, `stage_result.yaml` 산출물 검증
 

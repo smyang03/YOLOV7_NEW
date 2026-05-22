@@ -38,6 +38,14 @@ def shape_list(outputs):
     return [list(x.shape) for x in outputs]
 
 
+def fcos_raw_shapes(outputs):
+    shapes = []
+    for output in outputs:
+        if len(output.shape) == 4 and output.shape[1] >= 6:
+            shapes.append(list(output.shape))
+    return shapes
+
+
 def run_pytorch(weights, img, device):
     model = attempt_load(weights, map_location=device).eval()
     stride = int(max(model.stride)) if hasattr(model, 'stride') else 32
@@ -85,12 +93,16 @@ def main(opt):
     sample, torch_outputs, stride, img_size = run_pytorch(opt.weights, opt.img, device)
     onnx_outputs, onnx_error = run_onnx(Path(opt.onnx), sample) if Path(opt.onnx).is_file() else (None, 'onnx file missing')
 
+    torch_fcos_shapes = fcos_raw_shapes(torch_outputs)
+    onnx_fcos_shapes = fcos_raw_shapes(onnx_outputs or [])
+    schema_version = '1.3.6' if torch_fcos_shapes or onnx_fcos_shapes else '1.3.1'
+
     comparison = compare_outputs(torch_outputs, onnx_outputs) if onnx_outputs is not None else {
         'status': 'skip',
         'reason': onnx_error,
     }
     result = {
-        'schema_version': '1.3.1',
+        'schema_version': schema_version,
         'weights': opt.weights,
         'onnx': opt.onnx,
         'input_shape': list(sample.shape),
@@ -99,13 +111,16 @@ def main(opt):
         'img_size': img_size,
         'torch_output_shapes': shape_list(torch_outputs),
         'onnx_output_shapes': shape_list(onnx_outputs or []),
+        'torch_fcos_raw_shapes': torch_fcos_shapes,
+        'onnx_fcos_raw_shapes': onnx_fcos_shapes,
         'comparison': comparison,
     }
     contract = {
-        'schema_version': '1.3.1',
+        'schema_version': schema_version,
         'nms_mode': opt.nms_mode,
         'postprocess_in_graph': opt.nms_mode != 'none',
         'aux_exported': False,
+        'fcos_raw_exported': bool(onnx_fcos_shapes or torch_fcos_shapes),
         'input_name': 'images',
         'input_shape': list(sample.shape),
         'output_count': len(onnx_outputs or torch_outputs),

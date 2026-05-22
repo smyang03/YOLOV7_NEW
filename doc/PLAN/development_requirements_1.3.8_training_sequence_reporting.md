@@ -144,7 +144,7 @@ Markdown report와 csv/yaml은 같은 source dict에서 생성한다. 사람이 
 - label/class mapping 오류
 - `best.pt` 누락
 - stage yaml 누락
-- export 실패
+- `--require-export`를 켠 경우의 export 실패
 - metric csv 생성 실패
 
 ## 리포트 기반 정비 기준
@@ -284,10 +284,10 @@ COCO128은 성능 판단용이 아니다. 아래 항목만 확인한다.
 - `stage_result.yaml` 생성
 - `stage_summary.md` 생성
 - `metrics_delta.csv` 생성
-- `export_check.json` 생성 가능 여부
+- `export_check.json` 생성 가능 여부. 기본값은 `status: skip`이며 `--require-export`를 켠 경우에만 hard fail로 본다.
 - hard fail 분류 가능 여부
 
-COCO128에서 mAP가 낮거나 stage 간 mAP 변화가 이상해도 최종 성능 결론으로 사용하지 않는다. 단, crash, 산출물 누락, label 오류, export 실패는 hard fail로 처리한다.
+COCO128에서 mAP가 낮거나 stage 간 mAP 변화가 이상해도 최종 성능 결론으로 사용하지 않는다. 단, crash, 산출물 누락, label 오류는 hard fail로 처리한다. export 실패는 `--require-export`를 켠 경우에만 hard fail로 처리한다.
 
 ## 6. Delta 계산 계약
 
@@ -322,11 +322,14 @@ metric이 없는 경우:
 - `<stage>/stage_summary.md`
 - `<stage>/stage_result.yaml`
 - `<stage>/metrics_delta.csv`
+- `<stage>/debug_trace.log`
+- `<stage>/error_trace.log`
 
 sequence 종료 후:
 - `final_report/sequence_summary.md`
 - `final_report/metrics_delta_all.csv`
 - `final_report/decision_table.csv`
+- `final_report/<train_type>_summary.md`
 - `final_report/plots/*.png`, plot 실패는 soft warning
 
 최종 report:
@@ -349,6 +352,9 @@ sequence 종료 후:
 6. `retry_tune`은 stage당 1회만 실행된다.
 7. target full run 결과로 최종 report가 생성된다.
 8. 최종 report가 유지/제거/재실험/원인/다음 액션을 포함한다.
+9. command 실패 시 `stage_result.yaml`에 `exit_code`, `stdout_path`, `stderr_path`, `failed_category`, `missing_artifacts`가 기록된다.
+10. `--debug-log error` 사용 시 stage별 `error_trace.log`가 생성된다.
+11. `final_report/<train_type>_summary.md`가 학습 종류별로 생성된다.
 
 ## 9. 개발 착수 분리 기준
 
@@ -359,7 +365,8 @@ sequence 종료 후:
 | `1.3.8-P3` | COCO128 Stage 00~02 실행 | stage 산출물 생성 |
 | `1.3.8-P4` | `collect_stage_results.py`, `compare_stage_metrics.py` | delta csv 생성 |
 | `1.3.8-P5` | `generate_training_report.py` | stage/sequence/final report 생성 |
-| `1.3.8-P6` | full sequence 연결 | COCO128 전체 sequence report 생성 |
+| `1.3.8-P6` | train_type summary | 학습 종류별 summary 생성 |
+| `1.3.8-P7` | full sequence 연결 | COCO128 전체 sequence report 생성 |
 
 ## 10. 리스크 및 주의사항
 
@@ -369,3 +376,14 @@ sequence 종료 후:
 - quick run과 target full run의 report를 섞지 않는다.
 - final report는 사람이 읽는 markdown과 기계가 읽는 csv/yaml을 모두 남긴다.
 - 그래프는 보조 자료다. 그래프 실패가 metric 누락을 숨기면 안 된다.
+
+## 11. 구현 반영 메모
+
+- `utils/stage_schema.py`는 `StageConfig`, `StageResult`, `Decision`을 정의하고 YAML load/save/validate를 담당한다.
+- `tools/run_training_sequence.py`는 Stage 00~13 registry를 사용한다. Stage 12/13은 optional/defer로 두고, Stage 00~02 dry-run부터 산출물 경로와 command를 검증한다.
+- `tools/collect_stage_results.py`는 `results.csv`, `results.txt`, `profile.json`, `export_check.json`, `stage_result.yaml`을 표준 dict로 수집한다.
+- `tools/compare_stage_metrics.py`는 baseline, previous success, best previous 세 기준 delta를 CSV로 저장한다.
+- `tools/generate_training_report.py`는 `stage_summary.md`, `sequence_summary.md`, `metrics_delta_all.csv`, `decision_table.csv`, `final_report/<train_type>_summary.md`, `doc/REPORT/final_training_report_v1.8_YYYY-MM-DD.md`를 같은 source dict에서 생성한다.
+- `tools/run_training_sequence.py`는 stage command에 debug flag를 전달할 수 있어야 하며, 실패 시 `error_trace.log`와 `stage_result.yaml`을 동시에 남긴다.
+- target full run에서는 기본적으로 직전 성공 stage 대비 `primary_mAP < -0.02` 또는 family baseline 대비 `GFLOPs > +10%`이면 `drop` soft fail로 분류한다. COCO128 quick run에서는 성능 기반 drop을 금지한다.
+- ONNX/TensorRT 검증은 기본 필수 조건에서 제외한다. `export_check.json`은 기본 `skip`을 허용하고, Python export 검증을 강제하려면 sequence runner에 `--require-export`를 명시한다.

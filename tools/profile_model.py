@@ -99,11 +99,21 @@ def main(opt):
     total_boxes, per_level = estimate_boxes(model, img_size)
     detect = model.model[-1]
     strides = [level['stride'] for level in per_level]
+    model_yaml = getattr(model, 'yaml', {}) or {}
+
+    optional_experiment = any([
+        model_yaml.get('p2_head') == 'fcos',
+        model_yaml.get('neck_mod') in ('psa', 'gelan'),
+    ])
 
     result = {
-        'schema_version': '1.3.5',
+        'schema_version': '1.3.6' if optional_experiment else '1.3.5',
         'weights': opt.weights,
         'cfg': opt.cfg,
+        'p2_head': model_yaml.get('p2_head', 'none'),
+        'neck_mod': model_yaml.get('neck_mod', 'none'),
+        'psa_level': model_yaml.get('psa_level', 'none'),
+        'optional_experiment': optional_experiment,
         'input_shape': list(img.shape),
         'device': str(device),
         'stride': stride,

@@ -33,7 +33,9 @@ from utils.general import labels_to_class_weights, increment_path, labels_to_ima
 from utils.google_utils import attempt_download
 from utils.early_stopping import PhaseEarlyStopping
 from utils.augment_policy import ensure_aug_option_defaults, validate_aug_options
+from utils.debug_logging import get_debug_logger
 from utils.loss import ComputeLoss, ComputeLossOTA
+from utils.continual_loss import DistillationLoss
 from utils.loss_components import apply_loss_options, build_loss_state, ensure_loss_option_defaults, \
     get_loss_positive_count, load_loss_state, validate_loss_options
 from utils.model_options import ensure_structure_option_defaults, validate_structure_options
@@ -53,6 +55,51 @@ os.environ['KMP_DUPLICATE_LIB_OK']='True'
 logger = logging.getLogger(__name__)
 
 
+def apply_bn_policy(model, bn_policy):
+    if bn_policy != 'eval':
+        return
+    for module in model.modules():
+        if isinstance(module, nn.modules.batchnorm._BatchNorm):
+            module.eval()
+
+
+def stage_id_from_opt(opt):
+    aug_logging = getattr(opt, 'aug_profile', 'off') != 'off' or getattr(opt, 'sampler_mode', 'off') not in ('off', 'none')
+    core_logging = any((
+        getattr(opt, 'head', 'coupled') != 'coupled',
+        getattr(opt, 'loss_box', 'ciou') != 'ciou',
+        getattr(opt, 'assign', 'simota') != 'simota',
+        getattr(opt, 'loss_cls', 'bce') != 'bce',
+    ))
+    if aug_logging:
+        return '1.3.4'
+    if getattr(opt, 'phase_train', 'off') == 'on':
+        return '1.3.2'
+    if core_logging:
+        return '1.3.3'
+    return '1.3.1'
+
+
+def write_failed_run_artifacts(opt, exc):
+    save_dir = getattr(opt, 'save_dir', None)
+    if not save_dir:
+        return
+    train_logger = TrainLogger(save_dir, getattr(opt, 'log_format', 'both'),
+                               getattr(opt, 'per_class_log_interval', 10))
+    stage_id = stage_id_from_opt(opt)
+    result = train_logger.write_stage_result(
+        stage=stage_id,
+        stage_id=stage_id,
+        decision='blocker',
+        reason=f'{type(exc).__name__}: {exc}',
+        status='failed',
+        hard_fail=True,
+        failed_category='train',
+        current_run=str(save_dir),
+        exception_type=type(exc).__name__)
+    train_logger.write_run_summary(result)
+
+
 def train(hyp, opt, device, tb_writer=None):
     apply_loss_options(hyp, opt)
     logger.info(colorstr('hyperparameters: ') + ', '.join(f'{k}={v}' for k, v in hyp.items()))
@@ -68,7 +115,22 @@ def train(hyp, opt, device, tb_writer=None):
     phase_config = PhaseConfig.from_opt(opt)
     aug_logging = getattr(opt, 'aug_profile', 'off') != 'off' or getattr(opt, 'sampler_mode', 'off') not in ('off', 'none')
     train_logger = TrainLogger(save_dir, getattr(opt, 'log_format', 'both'),
-                               getattr(opt, 'per_class_log_interval', 10)) if rank in [-1, 0] and (phase_config.enabled or aug_logging) else None
+                               getattr(opt, 'per_class_log_interval', 10)) if rank in [-1, 0] else None
+    debug_logger = get_debug_logger(save_dir,
+                                    getattr(opt, 'debug_log', 'off'),
+                                    getattr(opt, 'debug_log_modules', ''),
+                                    rank=rank,
+                                    debug_file=getattr(opt, 'debug_log_file', 'debug_trace.log'))
+    debug_logger.log_event(
+        'debug', 'train', 'train', 'start', 'training started',
+        summary={
+            'save_dir': str(save_dir),
+            'epochs': epochs,
+            'batch_size': batch_size,
+            'weights': weights,
+            'phase_train': phase_config.enabled,
+            'log_format': getattr(opt, 'log_format', 'both'),
+        })
 
     # Save run settings
     with open(save_dir / 'hyp.yaml', 'w') as f:
@@ -294,6 +356,20 @@ def train(hyp, opt, device, tb_writer=None):
         model = torch.nn.SyncBatchNorm.convert_sync_batchnorm(model).to(device)
         logger.info('Using SyncBatchNorm()')
 
+    distill_loss_fn = DistillationLoss(
+        getattr(opt, 'distill_alpha', '0.0'),
+        getattr(opt, 'distill_beta', '0.0'),
+        getattr(opt, 'distill_conf_thres', 0.5))
+    teacher_model = None
+    if distill_loss_fn.active():
+        assert getattr(opt, 'teacher_weights', ''), '--teacher-weights is required when distillation is enabled'
+        teacher_model = attempt_load(opt.teacher_weights, map_location=device).eval()
+        for p in teacher_model.parameters():
+            p.requires_grad = False
+        logger.info(
+            f'Using teacher model for distillation: {opt.teacher_weights}, '
+            f'alpha={opt.distill_alpha}, beta={opt.distill_beta}')
+
     # Trainloader
 # train.py의 250번째 줄 근처 수정
     dataloader, dataset = build_train_dataloader(
@@ -373,6 +449,7 @@ def train(hyp, opt, device, tb_writer=None):
         epoch_start_time = time.time()
         stop_training = False
         model.train()
+        apply_bn_policy(model, getattr(opt, 'bn_policy', 'train'))
 
         if phase_config.enabled:
             next_phase_state = resolve_phase(epoch, phase_config)
@@ -479,6 +556,17 @@ def train(hyp, opt, device, tb_writer=None):
                 else:
                     loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
                     active_loss = compute_loss
+                if teacher_model is not None:
+                    with torch.no_grad():
+                        teacher_pred = teacher_model(imgs)
+                    distill_term, distill_items = distill_loss_fn(
+                        student_outputs=pred,
+                        teacher_outputs=teacher_pred,
+                        epoch=epoch,
+                        epochs=epochs)
+                    loss = loss + distill_term
+                    if loss_items.numel() >= 4:
+                        loss_items[3] += distill_term.detach()
                 epoch_positive_count += get_loss_positive_count(active_loss)
                 if rank != -1:
                     loss *= opt.world_size  # gradient averaged between devices in DDP mode
@@ -813,8 +901,21 @@ def train(hyp, opt, device, tb_writer=None):
         # Strip optimizers
         final = best if best.exists() else last  # final model
         if train_logger:
-            stage_name = '1.3.4' if aug_logging else '1.3.3'
-            train_logger.write_stage_result(
+            core_logging = any((
+                getattr(opt, 'head', 'coupled') != 'coupled',
+                getattr(opt, 'loss_box', 'ciou') != 'ciou',
+                getattr(opt, 'assign', 'simota') != 'simota',
+                getattr(opt, 'loss_cls', 'bce') != 'bce',
+            ))
+            if aug_logging:
+                stage_name = '1.3.4'
+            elif phase_config.enabled:
+                stage_name = '1.3.2'
+            elif core_logging:
+                stage_name = '1.3.3'
+            else:
+                stage_name = '1.3.1'
+            stage_result = train_logger.write_stage_result(
                 stage=stage_name,
                 baseline_run=None,
                 current_run=str(save_dir),
@@ -826,6 +927,8 @@ def train(hyp, opt, device, tb_writer=None):
                 sampler_mode=getattr(opt, 'sampler_mode', 'off'),
                 p2_head=getattr(opt, 'p2_head', 'none'),
                 neck_mod=getattr(opt, 'neck_mod', 'none'),
+                psa_level=getattr(opt, 'psa_level', 'none'),
+                optional_decision=getattr(opt, 'optional_decision', ''),
                 phase_train=phase_config.enabled,
                 phase_boundaries=phase_config.boundaries(),
                 best_epoch=None,
@@ -842,6 +945,7 @@ def train(hyp, opt, device, tb_writer=None):
                 export_check_json=None,
                 output_contract_json=None,
                 status='completed')
+            train_logger.write_run_summary(stage_result)
         for f in last, best:
             if f.exists():
                 strip_optimizer(f)  # strip optimizers
@@ -900,6 +1004,12 @@ if __name__ == '__main__':
     parser.add_argument('--v5-metric', action='store_true', help='assume maximum recall as 1.0 in AP calculation')
     parser.add_argument('--close-mosaic', type=int, default=0, help='close mosaic augmentation (epochs)')  # close_mosaic 인자 추가
     parser.add_argument('--model-saveoptimizer', action='store_true', help='Save model optimizer state')
+    parser.add_argument('--teacher-weights', type=str, default='', help='teacher checkpoint for finetune distillation')
+    parser.add_argument('--distill-alpha', type=str, default='0.0', help='cls/objectness distill weight or start:end')
+    parser.add_argument('--distill-beta', type=str, default='0.0', help='box/reg distill weight or start:end')
+    parser.add_argument('--distill-conf-thres', type=float, default=0.5, help='teacher confidence threshold for reg distill')
+    parser.add_argument('--bn-policy', choices=['train', 'eval'], default='train',
+                        help='BatchNorm policy for fine-tuning')
     parser.add_argument('--best-val-set', type=str, default='first',
                         help='Validation set to use for best model selection (first, last, Combined, test1, test2, etc.)')
     parser.add_argument('--phase-train', choices=['off', 'on'], default='off')
@@ -921,6 +1031,10 @@ if __name__ == '__main__':
     parser.add_argument('--profile', choices=['off', 'on'], default='off')
     parser.add_argument('--per-class-log-interval', type=int, default=10)
     parser.add_argument('--log-format', choices=['txt', 'csv', 'both'], default='both')
+    parser.add_argument('--debug-log', choices=['off', 'error', 'debug', 'trace'], default='off')
+    parser.add_argument('--debug-log-file', type=str, default='debug_trace.log')
+    parser.add_argument('--debug-log-modules', type=str,
+                        default='dataset,phase,model,loss,aug,sampler,finetune,runner')
     parser.add_argument('--no-verbose', action='store_true')
     parser.add_argument('--head', choices=['coupled', 'decoupled'], default='coupled')
     parser.add_argument('--loss-box', choices=['ciou', 'wiou_v3'], default='ciou')
@@ -930,8 +1044,10 @@ if __name__ == '__main__':
     parser.add_argument('--sampler-mode', choices=['off', 'none', 'weighted'], default='off')
     parser.add_argument('--aug-debug-samples', type=int, default=0)
     parser.add_argument('--hard-negative-manifest', type=str, default='')
-    parser.add_argument('--p2-head', choices=['none', 'anchor'], default='none')
-    parser.add_argument('--neck-mod', choices=['none', 'scdown'], default='none')
+    parser.add_argument('--p2-head', choices=['none', 'anchor', 'fcos'], default='none')
+    parser.add_argument('--neck-mod', choices=['none', 'scdown', 'psa', 'gelan'], default='none')
+    parser.add_argument('--psa-level', choices=['none', 'p5', 'p4p5', 'p3p4p5'], default='none')
+    parser.add_argument('--optional-decision', type=str, default='')
 
     opt = parser.parse_args()
     ensure_aug_option_defaults(opt)
@@ -998,7 +1114,25 @@ if __name__ == '__main__':
             prefix = colorstr('tensorboard: ')
             logger.info(f"{prefix}Start with 'tensorboard --logdir {opt.project}', view at http://localhost:6006/")
             tb_writer = SummaryWriter(opt.save_dir)  # Tensorboard
-        train(hyp, opt, device, tb_writer)
+        try:
+            train(hyp, opt, device, tb_writer)
+        except Exception as exc:
+            if opt.global_rank in [-1, 0]:
+                debug_logger = get_debug_logger(opt.save_dir,
+                                                getattr(opt, 'debug_log', 'off'),
+                                                getattr(opt, 'debug_log_modules', ''),
+                                                rank=opt.global_rank,
+                                                debug_file=getattr(opt, 'debug_log_file', 'debug_trace.log'))
+                debug_logger.log_exception(
+                    'train', 'main', exc,
+                    summary={'save_dir': str(opt.save_dir), 'data': opt.data, 'cfg': opt.cfg, 'weights': opt.weights})
+                try:
+                    write_failed_run_artifacts(opt, exc)
+                except Exception as artifact_exc:
+                    debug_logger.log_exception(
+                        'train', 'write_failed_run_artifacts', artifact_exc,
+                        summary={'save_dir': str(opt.save_dir)})
+            raise
 
     # Evolve hyperparameters (optional)
     else:

@@ -120,7 +120,39 @@ class SCDown(nn.Module):
 
     def forward(self, x):
         return self.cv2(self.cv1(x))
-    
+
+
+class PSABlock(nn.Module):
+    # Lightweight attention candidate for optional W6 neck ablations.
+    def __init__(self, c1, c2, k=1, s=1, reduction=4):
+        super(PSABlock, self).__init__()
+        self.cv = Conv(c1, c2, k, s)
+        c_ = max(c2 // reduction, 8)
+        self.pool = nn.AdaptiveAvgPool2d(1)
+        self.attn = nn.Sequential(
+            nn.Conv2d(c2, c_, 1, bias=True),
+            nn.SiLU(),
+            nn.Conv2d(c_, c2, 1, bias=True),
+            nn.Sigmoid(),
+        )
+
+    def forward(self, x):
+        y = self.cv(x)
+        return y * self.attn(self.pool(y))
+
+
+class GELANBlock(nn.Module):
+    # Compact GELAN-style candidate block for optional W6 neck ablations.
+    def __init__(self, c1, c2, k=1, s=1):
+        super(GELANBlock, self).__init__()
+        self.cv1 = Conv(c1, c2, 1, s)
+        self.cv2 = Conv(c2, c2, k, 1)
+        self.cv3 = Conv(c2, c2, 3, 1)
+        self.shortcut = Conv(c1, c2, 1, s) if c1 != c2 or s != 1 else nn.Identity()
+
+    def forward(self, x):
+        return self.cv3(self.cv2(self.cv1(x))) + self.shortcut(x)
+
 
 class RobustConv(nn.Module):
     # Robust convolution (use high kernel size 7-11 for: downsampling and other layers). Train for 300 - 450 epochs.

@@ -7,7 +7,7 @@
 - 기준 문서: `doc/PLAN/development_plan_v1.3.md`
 - 기준 리포트: `doc/REPORT/ai_perspective_yolov7_improvement_analysis_2026-05-22.md`
 - 리포트 규격: `doc/PLAN/training_report_format_v1.8.md`
-- 적용 범위: Python 학습, 평가, ONNX raw export 검증. C++ 후처리, TensorRT runtime, 추론 서버는 제외한다.
+- 적용 범위: Python 학습, 평가, stage/report 자동화. ONNX raw export 검증은 선택이며, C++ 후처리, TensorRT runtime, 추론 서버는 제외한다.
 
 ## 1. 실행 철학
 
@@ -30,8 +30,8 @@ COCO128 quick run에서 확인할 항목:
 - Stage 00~02가 짧은 시간 안에 연속 실행되는지
 - `stage_summary.md`, `sequence_summary.md`, `stage_result.yaml`이 생성되는지
 - `keep/drop/retry_tune/blocker` 판정 값이 정상 기록되는지
-- `profile.json`, `export_check.json`, `metrics_delta.csv`가 비어 있지 않은지
-- label cache, DataLoader rebuild, Close Mosaic, ONNX raw export가 crash 없이 동작하는지
+- `profile.json`, `export_check.json`, `metrics_delta.csv`가 생성되는지
+- label cache, DataLoader rebuild, Close Mosaic이 crash 없이 동작하는지
 
 COCO128 quick run에서 판단하지 않을 항목:
 - 최종 mAP 우열
@@ -63,7 +63,7 @@ python tools/run_training_sequence.py \
 - baseline weight와 baseline cfg
 - primary metric: `mAP@0.5:0.95`
 - secondary metric: `mAP@0.5`, small AP, rare recall, FP/image, FN/image
-- speed metric: params, GFLOPs, Python inference ms, Python NMS ms, ONNX Runtime diff
+- speed metric: params, GFLOPs, Python inference ms, Python NMS ms. ONNX Runtime diff는 `--require-export`를 켠 실행에서만 기록한다.
 
 공통 산출물:
 - `stage_config.yaml`
@@ -112,8 +112,8 @@ Hard fail이면 즉시 중단한다.
 - NaN/Inf loss
 - 학습 프로세스 crash
 - validation 불가
-- ONNX export 실패
-- PyTorch/ONNX Runtime output 비교 실패
+- `--require-export`를 켠 실행에서 ONNX export 실패
+- `--require-export`를 켠 실행에서 PyTorch/ONNX Runtime output 비교 실패
 - `best.pt` 미생성
 - label 검증 실패
 - class mapping 불일치

@@ -25,6 +25,11 @@ except ImportError:
 
 ROOT = Path(__file__).resolve().parents[1]
 P2_ANCHORS = [7, 10, 11, 18, 19, 14]
+PSA_HEAD_INDEXES = {
+    'p5': [12],
+    'p4p5': [24, 12],
+    'p3p4p5': [36, 24, 12],
+}
 
 
 def _resolve_yaml_path(path, parent):
@@ -44,6 +49,27 @@ def _apply_scdown(d):
         args = layer[3]
         if module == 'Conv' and len(args) >= 3 and args[1:3] == [3, 2] and args[0] in (128, 256, 384, 512):
             layer[2] = 'SCDown'
+
+
+def _replace_head_modules(d, indexes, module_name):
+    head = d.get('head', [])
+    for index in indexes:
+        if index >= len(head):
+            raise ValueError(f'{module_name} replacement index {index} is outside model head')
+        layer = head[index]
+        if layer[2] != 'Conv':
+            raise ValueError(f'{module_name} replacement expects Conv at head index {index}, got {layer[2]}')
+        layer[2] = module_name
+
+
+def _apply_psa(d, level):
+    if level not in PSA_HEAD_INDEXES:
+        raise ValueError(f'Unsupported PSA level: {level}')
+    _replace_head_modules(d, PSA_HEAD_INDEXES[level], 'PSABlock')
+
+
+def _apply_gelan(d):
+    _replace_head_modules(d, [12], 'GELANBlock')
 
 
 def _p2_training_head():
@@ -94,15 +120,21 @@ def load_model_yaml(cfg):
     base = load_model_yaml(base_path)
     merged = deepcopy(base)
     for key, value in data.items():
-        if key not in ('base', 'p2_head', 'neck_mod'):
+        if key not in ('base', 'p2_head', 'neck_mod', 'psa_level'):
             merged[key] = value
     if data.get('p2_head') == 'anchor':
         _apply_p2_head(merged)
-    if data.get('neck_mod') == 'scdown':
+    neck_mod = data.get('neck_mod')
+    if neck_mod == 'scdown':
         _apply_scdown(merged)
+    elif neck_mod == 'psa':
+        _apply_psa(merged, data.get('psa_level', 'p5'))
+    elif neck_mod == 'gelan':
+        _apply_gelan(merged)
     merged['cfg_base'] = str(base_path)
     merged['p2_head'] = data.get('p2_head', 'none')
-    merged['neck_mod'] = data.get('neck_mod', 'none')
+    merged['neck_mod'] = neck_mod or 'none'
+    merged['psa_level'] = data.get('psa_level', 'none')
     return merged
 
 
@@ -990,7 +1022,7 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
                 pass
 
         n = max(round(n * gd), 1) if n > 1 else n  # depth gain
-        if m in [nn.Conv2d, Conv, SCDown, RobustConv, RobustConv2, DWConv, GhostConv, RepConv, RepConv_OREPA, DownC,
+        if m in [nn.Conv2d, Conv, SCDown, PSABlock, GELANBlock, RobustConv, RobustConv2, DWConv, GhostConv, RepConv, RepConv_OREPA, DownC,
                  SPP, SPPF, SPPCSPC,SPPFCSPC,GhostSPPCSPC, MixConv2d, Focus, Stem, GhostStem, CrossConv, 
                  Bottleneck, BottleneckCSPA, BottleneckCSPB, BottleneckCSPC, 
                  RepBottleneck, RepBottleneckCSPA, RepBottleneckCSPB, RepBottleneckCSPC,  

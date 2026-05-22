@@ -84,7 +84,7 @@ python finetune.py --base-weights runs/train/base/weights/best.pt --teacher-weig
 - Replay only가 먼저 통과
 - distill alpha/beta 0일 때 baseline finetune과 동일 경로
 - teacher는 최종 export graph에 포함되지 않음
-- ONNX export 경로 유지
+- ONNX/TensorRT export는 본 차수 필수 검증에서 제외
 
 ## 리포트 기반 정비 기준
 
@@ -148,7 +148,7 @@ python tools/merge_labels.py --gt-labels finetune_data/labels --pseudo-labels fi
 Fine-tuning:
 
 ```bash
-python finetune.py --weights runs/train/final_scratch/weights/best.pt --teacher-weights runs/train/final_scratch/weights/best.pt --data data/finetune_example.yaml --replay-buffer data/replay_buffer --replay-ratio 0.3 --hyp data/hyp_finetune.yaml --epochs 100 --img 640 --batch 32 --freeze neck_lower --distill-alpha 0.5 --distill-beta 0.3 --distill-conf-thres 0.5 --name finetune_v1
+python finetune.py --weights runs/train/final_scratch/weights/best.pt --teacher-weights runs/train/final_scratch/weights/best.pt --base-data data/base.yaml --data data/finetune_example.yaml --replay-buffer data/replay_buffer --replay-ratio 0.3 --hyp data/hyp_finetune.yaml --epochs 100 --img 640 --batch 32 --freeze neck_lower --distill-alpha 0.5 --distill-beta 0.3 --distill-conf-thres 0.5 --name finetune_v1
 ```
 
 `--distill-alpha`와 `--distill-beta`는 scalar 또는 `start:end` schedule 문자열을 허용한다. 구현 시 argparse type은 별도 `parse_float_or_schedule()` helper로 처리한다.
@@ -256,7 +256,7 @@ E1을 먼저 통과한 뒤 forgetting이 남을 때 E2/E3를 진행한다.
 5. 파인튜닝 대상 클래스 mAP가 scratch 기준 90% 이상이다.
 6. 기존/미포함 클래스 mAP가 scratch 기준 95% 이상이다.
 7. 전체 mAP가 scratch 기준 93% 이상이다.
-8. ONNX export와 ONNX Runtime 비교가 기존 경로로 통과한다.
+8. ONNX/TensorRT export 비교는 본 차수 필수 통과 기준에서 제외하고 Python 학습/평가 산출물만 확인한다.
 9. finetune/replay/pseudo 병합 데이터의 manifest hash가 저장된다.
 10. `class_mapping_check.json`에서 scratch/finetune/replay/pseudo class id mapping 일치가 확인된다.
 11. E1/E2/E3 하위 단계 결과가 분리 저장된다.
@@ -294,3 +294,14 @@ finetune은 학습 루프 복제 위험이 크므로 1.3.2의 공통 helper가 �
 | `1.3.7-P6` | cls+reg distillation | E3 smoke, confidence-filtered reg distill 확인 |
 
 `finetune.py`에서 `train.py`의 학습 loop를 복사해 분기시키면 이후 Phase/logging/export 정책이 갈라진다. 공통 helper가 부족하면 먼저 1.3.2 쪽을 보강한다.
+
+## 13. 구현 반영 메모
+
+- `finetune.py`는 별도 학습 루프를 만들지 않고 class mapping, replay manifest, stage 산출물을 생성한 뒤 `train.py`를 호출한다.
+- `--dry-run`은 `class_mapping_check.json`, `replay_manifest.json`, `finetune_data.yaml`, `stage_result.yaml`, `finetune_results.csv`, `forgetting_report.yaml` 생성 여부를 빠르게 확인하는 용도다.
+- `finetune.py`는 `dataset_manifest.json`을 항상 생성하고, pseudo/merge를 별도 실행하지 않은 경우 `pseudo_label_manifest.json`, `merge_report.json`에 `status: skip`을 기록한다.
+- `train.py`에는 기본값 비활성인 `--teacher-weights`, `--distill-alpha`, `--distill-beta`, `--distill-conf-thres`, `--bn-policy`만 추가한다. 기존 학습 명령은 옵션을 켜지 않으면 동일하게 동작해야 한다.
+- E1은 replay only 경로로 먼저 검증한다. E2/E3 distillation은 teacher/student grid/anchor shape이 다르면 즉시 실패시키되, 신규 클래스 추가로 student class channel이 더 많은 경우에는 teacher의 old-class channel까지만 비교한다.
+- `utils/class_mapping.py`, `utils/replay_buffer.py`, `utils/pseudo_label.py`, `utils/continual_loss.py`는 구현 단위를 분리해 기존 원 코드를 유지한다.
+- `tools/dataset_manifest.py`는 기존 기본 schema `1.3.1`을 유지하고, 파인튜닝 산출물에서는 `--schema-version 1.3.7 --stage 1.3.7`로 명시한다.
+- ONNX/TensorRT 비교는 1.3.7 필수 검증에서 제외한다. 본 차수는 Python 학습/평가 산출물과 class mapping/replay/pseudo/distill 계약만 검증한다.

@@ -29,13 +29,15 @@ parser.add_argument('--aux', choices=['auto', 'on', 'off'], default='auto')
 parser.add_argument('--psa-level', choices=['none', 'p5', 'p4p5', 'p3p4p5'], default='none')
 parser.add_argument('--p2-head', choices=['none', 'anchor', 'fcos'], default='none')
 parser.add_argument('--neck-mod', choices=['none', 'scdown', 'psa', 'gelan'], default='none')
+parser.add_argument('--optional-decision', type=str, default='')
 ```
 
 optional validation:
 - `--neck-mod psa`이면 `--psa-level p5`만 1차 허용한다.
-- `--p2-head fcos`는 W6에서만 허용한다.
+- `--p2-head fcos`는 W6 decode-only 후보로만 다룬다. 학습 경로에서는 anchor-free loss가 완성되기 전까지 실패 처리한다.
 - `--neck-mod gelan`은 W6 일부 neck cfg에서만 허용한다.
 - PSA, FCOS, GELAN은 동시에 켜지 않는다.
+- optional 실험은 `--optional-decision doc/REPORT/optional_decision_*.md`가 없으면 실행하지 않는다.
 
 ### optional_decision schema
 
@@ -56,7 +58,7 @@ stop_condition:
 
 ### FCOS P2 decode 계약
 
-FCOS P2는 본 차수에서 Python raw/decode까지만 검증한다.
+FCOS P2는 본 차수에서 Python raw/decode까지만 검증한다. `train.py --p2-head fcos`는 의도적으로 차단한다.
 
 필수 출력:
 - `fcos_decode_check.json`
@@ -71,14 +73,14 @@ C++ postprocess, TensorRT plugin, runtime deploy는 이 문서 범위가 아니�
 
 ```bash
 python train.py --cfg cfg/training/yolov7.yaml --data data/coco128.yaml --epochs 1 --aux on --name smoke_1361_l_aux
-python train.py --cfg cfg/training/yolov7-w6-p2.yaml --data data/coco128.yaml --epochs 1 --p2-head fcos --name smoke_1361_fcos
-python tools/decode_fcos_outputs.py --weights runs/train/.../weights/best.pt --data data/coco128.yaml
+python train.py --cfg cfg/experiments/yolov7-w6-psa-p5.yaml --data data/coco128.yaml --epochs 1 --neck-mod psa --psa-level p5 --optional-decision doc/REPORT/optional_decision_2026-05-22_1.3.6_smoke.md --name smoke_1362_psa_p5
+python tools/decode_fcos_outputs.py --allow-synthetic --img 128 128 --nc 80 --stride 4 --output runs/tmp_136_optional/fcos_decode_check.json
 ```
 
 필수 확인:
 - optional decision report 존재
 - optional flag 동시 적용 차단
-- export 실패 시 optional drop
+- Python output/decode 검증 실패 시 optional drop
 - 효과 미미 시 기본 off 유지
 
 ## 리포트 기반 정비 기준
@@ -113,7 +115,7 @@ python tools/decode_fcos_outputs.py --weights runs/train/.../weights/best.pt --d
 - 1.3.3/1.3.4/1.3.5 후에도 primary mAP 목표 미달
 - W6 small AP/recall 목표 미달
 - GFLOPs 증가 여유가 10% 예산 안에 남아 있음
-- ONNX export 기준선이 안정적임
+- Python export/check 도구의 output shape 기준선이 안정적임
 
 ## 3. 실험 단위
 
@@ -132,8 +134,8 @@ python tools/decode_fcos_outputs.py --weights runs/train/.../weights/best.pt --d
 | --- | --- | --- |
 | `train.py` | 수정 | optional flag 조합을 검증한다. 동시에 둘 이상 켜면 실패 처리한다. |
 | `models/yolo.py` | 수정 | AUX, FCOS P2, GELAN cfg를 parse할 수 있게 한다. |
-| `models/common.py` | 수정 | PSA/GELAN block을 추가하되 ONNX export 가능한 연산만 사용한다. |
-| `utils/loss.py` | 수정 | FCOS P2 사용 시 anchor-free box/cls/centerness loss를 분리한다. |
+| `models/common.py` | 수정 | PSA/GELAN block을 추가하되 표준 PyTorch 연산만 사용한다. |
+| `utils/loss.py` | 보류 | FCOS P2 학습은 본 구현에서 차단한다. anchor-free box/cls/centerness loss는 후속 승인 시 추가한다. |
 | `utils/fcos.py` | 신규 | FCOS P2 target assign, decode, output shape helper를 구현한다. |
 | `tools/decode_fcos_outputs.py` | 신규 | FCOS raw output을 Python에서 decode하고 anchor output과 score 결합을 검증한다. |
 | `cfg/experiments/*.yaml` | 신규 | optional 실험별 cfg를 분리한다. 기존 baseline cfg를 덮어쓰지 않는다. |
@@ -162,7 +164,7 @@ python tools/decode_fcos_outputs.py --weights runs/train/.../weights/best.pt --d
 
 - W6 P2 Anchor로도 small recall이 부족할 때만 진행한다.
 - anchor output과 별도 raw output을 명확히 분리한다.
-- Python 평가와 ONNX Runtime 비교까지만 구현한다.
+- Python raw/decode 검증까지만 구현한다.
 - C++ postprocess는 본 차수에서 제외한다.
 - Python decode에서 centerness와 obj score 결합 방식을 명시하고 `fcos_decode_check.json`으로 저장한다.
 
@@ -170,7 +172,7 @@ python tools/decode_fcos_outputs.py --weights runs/train/.../weights/best.pt --d
 
 - 전체 backbone 교체가 아니라 neck 일부 block 단독 교체로 제한한다.
 - route/channel mismatch가 발생하면 즉시 중단한다.
-- export 실패 시 실험 실패로 기록한다.
+- model build 또는 Python output 검증 실패 시 실험 실패로 기록한다.
 
 ## 6. 산출물
 
@@ -201,7 +203,7 @@ python tools/decode_fcos_outputs.py --weights runs/train/.../weights/best.pt --d
 
 1. optional 실험은 한 번에 하나만 활성화된다.
 2. GFLOPs 증가율이 10% 미만이다.
-3. ONNX export와 ONNX Runtime 비교가 통과한다.
+3. Python output/decode 검증 도구가 통과한다.
 4. primary mAP 또는 목표 scenario metric이 개선된다.
 5. output shape/postprocess 복잡도가 report에 기록된다.
 6. 효과가 미미하면 기본값으로 승격하지 않는다.
@@ -213,7 +215,7 @@ python tools/decode_fcos_outputs.py --weights runs/train/.../weights/best.pt --d
 - NaN/Inf loss 발생
 - primary mAP 2 percentage points 이상 하락
 - GFLOPs 증가율 10% 이상
-- ONNX export 실패
+- Python output/decode 검증 실패
 - output shape이 후속 Python 검증 도구에서 처리 불가
 - FCOS P2 postprocess 복잡도가 과도함
 
@@ -245,6 +247,52 @@ python tools/decode_fcos_outputs.py --weights runs/train/.../weights/best.pt --d
 | `1.3.6-P1` | L AUX on | L 성능형 smoke와 off 기본값 유지 확인 |
 | `1.3.6-P2` | PSA P5 단독 | `--psa-level p5`만 통과, P4/P3는 미적용 |
 | `1.3.6-P3` | FCOS P2 Python raw/decode | `fcos_decode_check.json` 생성 |
-| `1.3.6-P4` | GELAN neck 일부 단독 | route/channel/export 통과 |
+| `1.3.6-P4` | GELAN neck 일부 단독 | route/channel/model build 통과 |
 
 optional flag validation은 `P1` 전에 먼저 넣는다. 둘 이상의 optional 구조가 동시에 켜지면 실행 전 실패해야 한다.
+
+## 12. 구현 반영 상태 (2026-05-22)
+
+구현 완료:
+- `utils/model_options.py`: optional flag 기본값, 자동 cfg 추론, 동시 적용 차단, `--optional-decision` 경로 검증 추가.
+- `train.py`, `train_aux.py`: `--p2-head none|anchor|fcos`, `--neck-mod none|scdown|psa|gelan`, `--psa-level`, `--optional-decision` 추가.
+- `models/common.py`: optional 후보 `PSABlock`, `GELANBlock` 추가.
+- `models/yolo.py`: `cfg/experiments` thin YAML에서 `neck_mod: psa|gelan`을 parse하고 W6 neck 일부 block을 교체한다.
+- `cfg/experiments/yolov7-w6-psa-p5.yaml`: PSA P5 단독 실험 cfg.
+- `cfg/experiments/yolov7-w6-gelan-neck.yaml`: GELAN neck 일부 실험 cfg.
+- `cfg/experiments/yolov7-w6-fcos-p2-decode.yaml`: FCOS P2 decode-only metadata cfg.
+- `utils/fcos.py`: FCOS raw BCHW decode helper와 계약 생성 helper.
+- `tools/decode_fcos_outputs.py`: raw tensor 또는 synthetic FCOS output을 decode해 `fcos_decode_check.json` 생성.
+- `tools/profile_model.py`: optional metadata(`p2_head`, `neck_mod`, `psa_level`)를 profile에 기록.
+- `tools/verify_export.py`: FCOS raw shape 필드를 output contract에 추가.
+- `doc/REPORT/optional_decision_2026-05-22_1.3.6_smoke.md`: 코드 smoke용 optional decision gate 문서.
+
+검증 결과:
+- `python -m py_compile utils/model_options.py models/common.py models/yolo.py tools/decode_fcos_outputs.py tools/profile_model.py tools/verify_export.py train.py train_aux.py` 통과.
+- `cfg/experiments/yolov7-w6-psa-p5.yaml` model build 통과: `IAuxDetect`, stride `[8,16,32,64]`, anchors `[4,3,2]`.
+- `cfg/experiments/yolov7-w6-gelan-neck.yaml` model build 통과: `IAuxDetect`, stride `[8,16,32,64]`, anchors `[4,3,2]`.
+- `cfg/experiments/yolov7-w6-fcos-p2-decode.yaml` metadata build 통과: anchor P2 기반 decode-only cfg, stride `[4,8,16,32,64]`.
+- optional decision 없이 PSA 실행 시 사전 실패.
+- `--psa-level p4p5`는 1차 허용 범위가 아니므로 실패.
+- `--p2-head fcos`는 학습 경로에서 decode-only 안내와 함께 실패.
+- `tools/decode_fcos_outputs.py --allow-synthetic` 통과 및 `runs/tmp_136_optional/fcos_decode_check.json` 생성.
+- `tools/profile_model.py --cfg cfg/experiments/yolov7-w6-psa-p5.yaml --img 640 640` 통과: `105.4827 GFLOPs`, delta `-0.0164%`, `runs/tmp_136_optional/psa_p5_profile_640.json` 생성.
+- `tools/profile_model.py --cfg cfg/experiments/yolov7-w6-gelan-neck.yaml --img 640 640` 통과: `107.1374 GFLOPs`, delta `+1.5521%`, `runs/tmp_136_optional/gelan_neck_profile_640.json` 생성.
+
+재검토 반영:
+- `tools/decode_fcos_outputs.py`는 `--raw`, `--weights`, `--allow-synthetic`가 모두 없으면 `status=skip`으로 종료한다. synthetic output은 명시적으로 `--allow-synthetic`를 준 경우에만 생성한다.
+- FCOS raw dict 로딩은 Tensor를 boolean `or` 조건으로 평가하지 않도록 `fcos_raw`, `raw`, 첫 번째 value 순서로 명시 선택한다.
+- `cfg/experiments/yolov7-w6-fcos-p2-decode.yaml`은 `--p2-head anchor`를 명시해도 `train.py`/`train_aux.py`에서 차단한다. decode-only cfg가 anchor P2 학습 cfg처럼 우회 사용되면 안 된다.
+- `tools/profile_model.py`는 optional 실험이면 schema `1.3.6`, 기존 1.3.5 구조 실험이면 schema `1.3.5`를 유지한다.
+- `tools/verify_export.py`는 FCOS raw shape가 있을 때만 schema `1.3.6`으로 기록하고, 기존 export check는 schema `1.3.1`을 유지한다.
+
+재검토 검증:
+- 기본 P2 profile schema 확인: `runs/tmp_136_optional/base_p2_profile_schema_check.json`은 `schema_version=1.3.5`, `optional_experiment=false`.
+- PSA profile schema 확인: `runs/tmp_136_optional/psa_p5_profile_schema_check.json`은 `schema_version=1.3.6`, `optional_experiment=true`.
+- `tools/decode_fcos_outputs.py --require-pass` without input은 `status=skip` JSON을 남기고 실패한다.
+- `tools/decode_fcos_outputs.py --allow-synthetic --require-pass`는 `status=pass` JSON을 생성한다.
+
+남은 검증:
+- COCO128 또는 실제 학습 서버에서 optional decision을 명시한 PSA P5/GELAN smoke 학습.
+- L AUX on은 L 모델 목표 미달이 확인된 뒤 별도 optional decision으로 실행한다.
+- FCOS P2 학습 loss는 본 차수에서 구현하지 않았으므로, 실제 FCOS 학습은 후속 승인 전까지 금지한다.

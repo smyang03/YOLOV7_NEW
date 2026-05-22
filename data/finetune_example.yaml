@@ -1,0 +1,9 @@
+# Example only. Keep class indexes aligned with the scratch/base data yaml.
+train: ./finetune/images/train
+val: ./finetune/images/val
+
+nc: 3
+names:
+  - person
+  - vehicle
+  - safety_vest
