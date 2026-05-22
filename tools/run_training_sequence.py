@@ -115,9 +115,27 @@ def family_cfg(opt, family):
     return opt.w6_cfg or opt.cfg
 
 
+def launcher_prefix(opt):
+    if getattr(opt, 'launcher', 'none') == 'none':
+        return [sys.executable]
+    if opt.launcher == 'distributed':
+        prefix = [
+            sys.executable, '-m', 'torch.distributed.launch',
+            '--nproc_per_node', str(opt.nproc_per_node),
+        ]
+        if opt.nnodes != 1:
+            prefix.extend(['--nnodes', str(opt.nnodes)])
+            prefix.extend(['--node_rank', str(opt.node_rank)])
+            prefix.extend(['--master_addr', opt.master_addr])
+        if opt.master_port:
+            prefix.extend(['--master_port', str(opt.master_port)])
+        return prefix
+    raise ValueError(f'unsupported launcher: {opt.launcher}')
+
+
 def build_train_command(opt, config, family):
-    command = [
-        sys.executable, str(ROOT / 'train.py'),
+    command = launcher_prefix(opt) + [
+        str(ROOT / 'train.py'),
         '--data', config.data,
         '--project', str(Path(config.output_dir).parent),
         '--name', Path(config.output_dir).name,
@@ -138,6 +156,12 @@ def build_train_command(opt, config, family):
         command.extend(['--device', opt.device])
     if opt.workers >= 0:
         command.extend(['--workers', str(opt.workers)])
+    if getattr(opt, 'sync_bn', False):
+        command.append('--sync-bn')
+    if getattr(opt, 'image_weights', False):
+        command.append('--image-weights')
+    if getattr(opt, 'multi_scale', False):
+        command.append('--multi-scale')
     if getattr(opt, 'debug_log', 'off') != 'off':
         command.extend(['--debug-log', opt.debug_log])
         command.extend(['--debug-log-file', opt.debug_log_file])
@@ -557,6 +581,8 @@ class TrainingSequenceRunner:
             'model_family': self.opt.model_family,
             'output': str(self.output),
             'dry_run': self.opt.dry_run,
+            'launcher': self.opt.launcher,
+            'nproc_per_node': self.opt.nproc_per_node,
             'stage_count': len(self.results),
             'report_output': report_output,
         }
@@ -567,6 +593,17 @@ class TrainingSequenceRunner:
 def main(opt):
     if not Path(opt.plan).is_file():
         raise SystemExit(f'plan file not found: {opt.plan}')
+    if not opt.output:
+        if opt.project and opt.name:
+            opt.output = str(Path(opt.project) / opt.name)
+        else:
+            raise SystemExit('the following arguments are required: --output or --project plus --name')
+    if opt.launcher == 'distributed':
+        if opt.nproc_per_node < 1:
+            raise SystemExit('--nproc-per-node must be >= 1 when --launcher distributed is used')
+        world_size = opt.nnodes * opt.nproc_per_node
+        if opt.batch_size % world_size != 0:
+            raise SystemExit('--batch-size must be a multiple of distributed world size')
     if not opt.dry_run and not opt.weights and not opt.l_weights and not opt.w6_weights and not opt.cfg and not opt.l_cfg and not opt.w6_cfg:
         raise SystemExit('real sequence run requires --weights/--l-weights/--w6-weights or --cfg/--l-cfg/--w6-cfg')
     runner = TrainingSequenceRunner(opt)
@@ -580,7 +617,10 @@ if __name__ == '__main__':
     parser.add_argument('--data', type=str, required=True)
     parser.add_argument('--dataset-profile', choices=['coco128_quick', 'target_full'], required=True)
     parser.add_argument('--model-family', type=str, required=True, help='l,w6,l_only,w6_only,l or w6')
-    parser.add_argument('--output', type=str, required=True)
+    parser.add_argument('--output', type=str, default='')
+    parser.add_argument('--project', type=str, default='', help='compatibility alias used with --name when --output is omitted')
+    parser.add_argument('--name', type=str, default='', help='compatibility alias used with --project when --output is omitted')
+    parser.add_argument('--exist-ok', action='store_true', help='accepted for train.py command compatibility')
     parser.add_argument('--stop-on-hard-fail', action='store_true')
     parser.add_argument('--start-stage', type=str, default='')
     parser.add_argument('--end-stage', type=str, default='')
@@ -590,9 +630,9 @@ if __name__ == '__main__':
     parser.add_argument('--skip-plots', action='store_true')
     parser.add_argument('--skip-profile', action='store_true')
     parser.add_argument('--require-export', action='store_true')
-    parser.add_argument('--epochs', type=int, default=3)
+    parser.add_argument('--epochs', '--epoch', dest='epochs', type=int, default=3)
     parser.add_argument('--batch-size', '--batch', dest='batch_size', type=int, default=16)
-    parser.add_argument('--img', nargs='+', type=int, default=[640, 640])
+    parser.add_argument('--img', '--img-size', dest='img', nargs='+', type=int, default=[640, 640])
     parser.add_argument('--hyp', type=str, default='data/hyp.scratch.p5.yaml')
     parser.add_argument('--weights', type=str, default='')
     parser.add_argument('--l-weights', type=str, default='')
@@ -602,7 +642,17 @@ if __name__ == '__main__':
     parser.add_argument('--w6-cfg', type=str, default='')
     parser.add_argument('--device', type=str, default='')
     parser.add_argument('--profile-device', type=str, default='cpu')
-    parser.add_argument('--workers', type=int, default=8)
+    parser.add_argument('--workers', '--worker', dest='workers', type=int, default=8)
+    parser.add_argument('--sync-bn', action='store_true', help='pass SyncBatchNorm flag to each training stage')
+    parser.add_argument('--image-weights', action='store_true', help='pass image-weights flag to each training stage')
+    parser.add_argument('--multi-scale', action='store_true', help='pass multi-scale flag to each training stage')
+    parser.add_argument('--launcher', choices=['none', 'distributed'], default='none',
+                        help='run each stage command directly or through torch.distributed.launch')
+    parser.add_argument('--nproc-per-node', '--nproc_per_node', dest='nproc_per_node', type=int, default=1)
+    parser.add_argument('--nnodes', type=int, default=1)
+    parser.add_argument('--node-rank', '--node_rank', dest='node_rank', type=int, default=0)
+    parser.add_argument('--master-addr', '--master_addr', dest='master_addr', type=str, default='127.0.0.1')
+    parser.add_argument('--master-port', '--master_port', dest='master_port', type=str, default='')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--baseline-gflops', type=float, default=None)
     parser.add_argument('--min-primary-map-delta', type=float, default=-0.02,
