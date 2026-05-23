@@ -1,0 +1,2 @@
+stage,model,enabled_flags,decision,reason,primary_mAP_delta,small_AP_delta,rare_recall_delta,FP_delta,FN_delta,GFLOPs_delta_percent,NMS_delta_ms,export_status,risk_level,next_action
+00,l,{},blocker,training command failed with exit code 1,,,,,,,,skip,blocker,

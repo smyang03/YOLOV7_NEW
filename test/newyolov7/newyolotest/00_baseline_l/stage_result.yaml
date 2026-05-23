@@ -1,0 +1,88 @@
+stage_id: '00'
+decision: blocker
+reason: training command failed with exit code 1
+best_weight: ''
+fallback_weight: ''
+metrics:
+  primary_mAP: null
+  mAP50: null
+  precision: null
+  recall: null
+  GFLOPs: null
+  GFLOPs_delta_percent: null
+  python_infer_ms: null
+  python_nms_ms: null
+  small_AP: null
+  rare_recall: null
+  FP_per_image: null
+  FN_per_image: null
+  export_status: skip
+  onnx_max_abs_diff: null
+export_status: skip
+hard_fail: true
+soft_fail: false
+failed_category: train
+primary_mAP: null
+mAP50: null
+small_AP: null
+rare_recall: null
+FP_per_image: null
+FN_per_image: null
+GFLOPs: null
+GFLOPs_delta_percent: null
+python_infer_ms: null
+python_nms_ms: null
+onnx_max_abs_diff: null
+exit_code: 1
+stdout_path: runs/newyolov7/newyolotest/00_baseline_l/stdout.log
+stderr_path: runs/newyolov7/newyolotest/00_baseline_l/stderr.log
+command:
+- /opt/conda/bin/python
+- -m
+- torch.distributed.launch
+- --nproc_per_node
+- '8'
+- --master_port
+- '9527'
+- /workspace/datasets/YOLOV7_NEW/train.py
+- --data
+- data/coco128.yaml
+- --project
+- runs/newyolov7/newyolotest
+- --name
+- 00_baseline_l
+- --exist-ok
+- --epochs
+- '300'
+- --batch-size
+- '32'
+- --img-size
+- '640'
+- '640'
+- --weights
+- ''
+- --cfg
+- cfg/training/yolov7.yaml
+- --hyp
+- data/hyp.scratch.p5.yaml
+- --device
+- 0,1,2,3,4,5,6,7
+- --workers
+- '8'
+- --sync-bn
+- --debug-log
+- error
+- --debug-log-file
+- debug_trace.log
+- --debug-log-modules
+- dataset,phase,model,loss,aug,sampler,finetune,runner
+carry_flags: {}
+disabled_flags: {}
+train_type: baseline_export
+missing_artifacts:
+- weights/best.pt|weights/last.pt
+log_paths:
+  stdout: runs/newyolov7/newyolotest/00_baseline_l/stdout.log
+  stderr: runs/newyolov7/newyolotest/00_baseline_l/stderr.log
+  debug_trace: runs/newyolov7/newyolotest/00_baseline_l/debug_trace.log
+  error_trace: runs/newyolov7/newyolotest/00_baseline_l/error_trace.log

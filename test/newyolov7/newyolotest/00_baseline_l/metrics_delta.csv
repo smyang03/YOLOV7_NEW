@@ -1,0 +1,12 @@
+stage_id,model_family,metric,baseline,previous_success,best_previous,current,delta_vs_baseline,delta_vs_previous_success,delta_vs_best_previous
+00,l,primary_mAP,,,,,,,
+00,l,mAP50,,,,,,,
+00,l,small_AP,,,,,,,
+00,l,rare_recall,,,,,,,
+00,l,FP_per_image,,,,,,,
+00,l,FN_per_image,,,,,,,
+00,l,GFLOPs,,,,,,,
+00,l,GFLOPs_delta_percent,,,,,,,
+00,l,python_infer_ms,,,,,,,
+00,l,python_nms_ms,,,,,,,
+00,l,onnx_max_abs_diff,,,,,,,

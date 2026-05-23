@@ -1,0 +1,17 @@
+# CrowdHuman dataset for staged YOLOv7 training.
+# Expected list-file layout on the training server:
+#   /workspace/datasets/YOLOV7_NEW/list/train.txt
+#   /workspace/datasets/YOLOV7_NEW/list/vaili.txt
+#
+# Each txt file must contain one image path per line. Label paths are inferred
+# from image paths by replacing /images/ or /JPEGImages/ with /labels/.
+#
+# If your converted labels contain only full-body person boxes, change to:
+#   nc: 1
+#   names: ['person']
+
+train: /workspace/datasets/YOLOV7_NEW/list/train.txt
+val: /workspace/datasets/YOLOV7_NEW/list/vaili.txt
+
+nc: 2
+names: ['person', 'head']

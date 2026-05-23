@@ -55,6 +55,63 @@ os.environ['KMP_DUPLICATE_LIB_OK']='True'
 logger = logging.getLogger(__name__)
 
 
+def format_duration(seconds):
+    seconds = max(0, int(seconds))
+    hours, remainder = divmod(seconds, 3600)
+    minutes, seconds = divmod(remainder, 60)
+    if hours:
+        return f'{hours:d}h{minutes:02d}m{seconds:02d}s'
+    if minutes:
+        return f'{minutes:d}m{seconds:02d}s'
+    return f'{seconds:d}s'
+
+
+def log_epoch_start(opt, epoch, epochs, phase, batches):
+    logger.info(
+        '[progress] stage=%s epoch=%d/%d start phase=%s batches=%d total_batch=%s world_size=%s',
+        Path(opt.save_dir).name, epoch + 1, epochs, phase, batches,
+        getattr(opt, 'total_batch_size', getattr(opt, 'batch_size', '')),
+        getattr(opt, 'world_size', 1))
+
+
+def log_epoch_end(opt, epoch, epochs, start_epoch, run_start_time, epoch_start_time,
+                  phase, mloss, results, is_best):
+    now = time.time()
+    epoch_seconds = now - epoch_start_time
+    completed = max(1, epoch - start_epoch + 1)
+    remaining = max(0, epochs - epoch - 1)
+    avg_seconds = (now - run_start_time) / completed
+    eta_seconds = avg_seconds * remaining
+    losses = [float(x) for x in list(mloss)]
+    metrics = [float(x) for x in list(results)]
+    logger.info(
+        '[progress] stage=%s epoch=%d/%d done phase=%s epoch_time=%s avg_epoch=%s elapsed=%s eta=%s '
+        'loss(box/obj/cls/total)=%.4g/%.4g/%.4g/%.4g P=%.4g R=%.4g mAP50=%.4g mAP50-95=%.4g best=%s',
+        Path(opt.save_dir).name, epoch + 1, epochs, phase,
+        format_duration(epoch_seconds), format_duration(avg_seconds),
+        format_duration(now - run_start_time), format_duration(eta_seconds),
+        losses[0], losses[1], losses[2], losses[3],
+        metrics[0], metrics[1], metrics[2], metrics[3], bool(is_best))
+
+
+def log_batch_progress(opt, epoch, epochs, batch_i, total_batches, epoch_start_time, mloss, targets, imgs):
+    interval = int(getattr(opt, 'progress_log_interval', 50) or 0)
+    batch_num = batch_i + 1
+    if interval <= 0 or (batch_num % interval and batch_num != total_batches):
+        return
+    elapsed = time.time() - epoch_start_time
+    seconds_per_batch = elapsed / max(1, batch_num)
+    eta = seconds_per_batch * max(0, total_batches - batch_num)
+    losses = [float(x) for x in list(mloss)]
+    mem = torch.cuda.memory_reserved() / 1E9 if torch.cuda.is_available() else 0.0
+    logger.info(
+        '[progress] stage=%s epoch=%d/%d batch=%d/%d epoch_elapsed=%s epoch_eta=%s '
+        'gpu_mem=%.3gG loss=%.4g/%.4g/%.4g/%.4g labels=%d img=%d',
+        Path(opt.save_dir).name, epoch + 1, epochs, batch_num, total_batches,
+        format_duration(elapsed), format_duration(eta), mem,
+        losses[0], losses[1], losses[2], losses[3], int(targets.shape[0]), int(imgs.shape[-1]))
+
+
 def apply_bn_policy(model, bn_policy):
     if bn_policy != 'eval':
         return
@@ -515,6 +572,9 @@ def train(hyp, opt, device, tb_writer=None):
         # b = int(random.uniform(0.25 * imgsz, 0.75 * imgsz + gs) // gs * gs)
         # dataset.mosaic_border = [b - imgsz, -b]  # height, width borders
 
+        if rank in [-1, 0]:
+            log_epoch_start(opt, epoch, epochs, active_phase_name, nb)
+
         mloss = torch.zeros(4, device=device)  # mean losses
         epoch_positive_count = 0
         if hasattr(getattr(dataloader, 'sampler', None), 'set_epoch'):
@@ -591,6 +651,7 @@ def train(hyp, opt, device, tb_writer=None):
                 s = ('%10s' * 2 + '%10.4g' * 6) % (
                     '%g/%g' % (epoch, epochs - 1), mem, *mloss, targets.shape[0], imgs.shape[-1])
                 pbar.set_description(s)
+                log_batch_progress(opt, epoch, epochs, i, nb, epoch_start_time, mloss, targets, imgs)
 
                 # Plot
                 if plots and ni < 10:
@@ -866,6 +927,8 @@ def train(hyp, opt, device, tb_writer=None):
                 del ckpt
                 torch.cuda.empty_cache()
                 gc.collect()
+            log_epoch_end(opt, epoch, epochs, start_epoch, t0, epoch_start_time,
+                          active_phase_name, mloss, results, is_best)
 
         if stop_training:
             break
@@ -1035,6 +1098,8 @@ if __name__ == '__main__':
     parser.add_argument('--debug-log-file', type=str, default='debug_trace.log')
     parser.add_argument('--debug-log-modules', type=str,
                         default='dataset,phase,model,loss,aug,sampler,finetune,runner')
+    parser.add_argument('--progress-log-interval', type=int, default=50,
+                        help='print rank0 batch progress every N batches; 0 disables')
     parser.add_argument('--no-verbose', action='store_true')
     parser.add_argument('--head', choices=['coupled', 'decoupled'], default='coupled')
     parser.add_argument('--loss-box', choices=['ciou', 'wiou_v3'], default='ciou')

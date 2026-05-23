@@ -2,6 +2,7 @@ import argparse
 import json
 import subprocess
 import sys
+import threading
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
@@ -162,6 +163,8 @@ def build_train_command(opt, config, family):
         command.append('--image-weights')
     if getattr(opt, 'multi_scale', False):
         command.append('--multi-scale')
+    if getattr(opt, 'progress_log_interval', None) is not None:
+        command.extend(['--progress-log-interval', str(opt.progress_log_interval)])
     if getattr(opt, 'debug_log', 'off') != 'off':
         command.extend(['--debug-log', opt.debug_log])
         command.extend(['--debug-log-file', opt.debug_log_file])
@@ -188,21 +191,66 @@ def best_weight_path(stage_dir):
     return ''
 
 
-def run_command(command, stage_dir, debug_logger=None):
+def _stream_pipe(pipe, log_handle, console_handle=None):
+    while True:
+        line = pipe.readline()
+        if not line:
+            break
+        log_handle.write(line)
+        log_handle.flush()
+        if console_handle:
+            console_handle.write(line)
+            console_handle.flush()
+
+
+def _console_handle(console_log, stream_name):
+    if console_log == 'all' or console_log == stream_name:
+        return sys.stderr if stream_name == 'stderr' else sys.stdout
+    return None
+
+
+def run_command(command, stage_dir, debug_logger=None, console_log='stderr'):
     stdout = Path(stage_dir) / 'stdout.log'
     stderr = Path(stage_dir) / 'stderr.log'
     if debug_logger:
         debug_logger.log_event(
             'debug', 'runner', 'run_command', 'command_start', 'stage command started',
             summary={'command': command, 'stdout_path': str(stdout), 'stderr_path': str(stderr)})
+    if console_log != 'off':
+        print(f'\n[runner] stage start: {Path(stage_dir).name}', flush=True)
+        print(f'[runner] stdout: {stdout}', flush=True)
+        print(f'[runner] stderr: {stderr}', flush=True)
     with stdout.open('w', encoding='utf-8') as out, stderr.open('w', encoding='utf-8') as err:
-        completed = subprocess.run(command, cwd=str(ROOT), stdout=out, stderr=err, check=False)
+        if console_log == 'off':
+            completed = subprocess.run(command, cwd=str(ROOT), stdout=out, stderr=err, check=False)
+            exit_code = completed.returncode
+        else:
+            process = subprocess.Popen(
+                command, cwd=str(ROOT), stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                text=True, encoding='utf-8', errors='replace', bufsize=1)
+            threads = [
+                threading.Thread(
+                    target=_stream_pipe,
+                    args=(process.stdout, out, _console_handle(console_log, 'stdout')),
+                    daemon=True),
+                threading.Thread(
+                    target=_stream_pipe,
+                    args=(process.stderr, err, _console_handle(console_log, 'stderr')),
+                    daemon=True),
+            ]
+            for thread in threads:
+                thread.start()
+            exit_code = process.wait()
+            for thread in threads:
+                thread.join()
     if debug_logger:
-        level = 'error' if completed.returncode else 'debug'
+        level = 'error' if exit_code else 'debug'
         debug_logger.log_event(
             level, 'runner', 'run_command', 'command_end', 'stage command completed',
-            summary={'exit_code': completed.returncode, 'stdout_path': str(stdout), 'stderr_path': str(stderr)})
-    return completed.returncode, stdout, stderr
+            summary={'exit_code': exit_code, 'stdout_path': str(stdout), 'stderr_path': str(stderr)})
+    if console_log != 'off':
+        print(f'\n[runner] stage end: {Path(stage_dir).name} exit_code={exit_code}', flush=True)
+    return exit_code, stdout, stderr
 
 
 def missing_artifacts(stage_dir, require_export=False):
@@ -521,7 +569,9 @@ class TrainingSequenceRunner:
                                             getattr(self.opt, 'debug_log', 'off'),
                                             getattr(self.opt, 'debug_log_modules', ''),
                                             debug_file=getattr(self.opt, 'debug_log_file', 'debug_trace.log'))
-            exit_code, stdout_path, stderr_path = run_command(config.command, stage_dir, debug_logger)
+            exit_code, stdout_path, stderr_path = run_command(
+                config.command, stage_dir, debug_logger,
+                console_log=getattr(self.opt, 'console_log', 'stderr'))
             best = best_weight_path(stage_dir)
             run_profile(self.opt, stage_dir, best)
             placeholder_export(stage_dir, require_export=self.opt.require_export)
@@ -583,6 +633,7 @@ class TrainingSequenceRunner:
             'dry_run': self.opt.dry_run,
             'launcher': self.opt.launcher,
             'nproc_per_node': self.opt.nproc_per_node,
+            'console_log': self.opt.console_log,
             'stage_count': len(self.results),
             'report_output': report_output,
         }
@@ -663,5 +714,9 @@ if __name__ == '__main__':
     parser.add_argument('--debug-log-file', type=str, default='debug_trace.log')
     parser.add_argument('--debug-log-modules', type=str,
                         default='dataset,phase,model,loss,aug,sampler,finetune,runner')
+    parser.add_argument('--console-log', choices=['off', 'stderr', 'stdout', 'all'], default='stderr',
+                        help='stream stage logs to console while still writing stdout.log/stderr.log')
+    parser.add_argument('--progress-log-interval', type=int, default=50,
+                        help='pass rank0 batch progress interval to each training stage; 0 disables')
     parser.add_argument('--report-output', type=str, default='')
     main(parser.parse_args())
