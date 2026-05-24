@@ -5,6 +5,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from utils.general import bbox_iou, bbox_alpha_iou, box_iou, box_giou, box_diou, box_ciou, xywh2xyxy
+from utils.fcos import fcos_targets
 from utils.loss_components import box_loss_from_iou, classification_loss, init_loss_options
 from utils.tal import assignment_cost
 from utils.torch_utils import is_parallel
@@ -13,6 +14,134 @@ from utils.torch_utils import is_parallel
 def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#issuecomment-598028441
     # return positive, negative label smoothing BCE targets
     return 1.0 - 0.5 * eps, 0.5 * eps
+
+
+class ComputeLossFCOS:
+    def __init__(self, model, hyp=None, opt=None):
+        device = next(model.parameters()).device
+        det = model.module.model[-1] if is_parallel(model) else model.model[-1]
+        self.det = det.fcos if hasattr(det, 'fcos') else det
+        self.nc = self.det.nc
+        self.strides = [float(x) for x in self.det.stride]
+        self.hyp = hyp or getattr(model, 'hyp', {}) or {}
+        self.opt = opt
+        self.BCEcls = nn.BCEWithLogitsLoss(reduction='sum')
+        self.BCEctr = nn.BCEWithLogitsLoss(reduction='sum')
+        self.cp, self.cn = smooth_BCE(getattr(opt, 'label_smoothing', 0.0) if opt is not None else 0.0)
+        self.center_radius = getattr(opt, 'fcos_center_radius', 1.5) if opt is not None else 1.5
+        self.loss_box = getattr(opt, 'fcos_loss_box', 'giou') if opt is not None else 'giou'
+        self.last_positive_count = 0
+        self.last_stats = {}
+        self.device = device
+
+    def __call__(self, predictions, targets, imgs=None):
+        raw_outputs = predictions.get('fcos') if isinstance(predictions, dict) else predictions
+        raw_outputs = [x.float() for x in raw_outputs]
+        batch_size = raw_outputs[0].shape[0]
+        img_size = tuple(int(x) for x in (imgs.shape[-2:] if imgs is not None else (
+            raw_outputs[0].shape[-2] * int(self.strides[0]),
+            raw_outputs[0].shape[-1] * int(self.strides[0]))))
+        feature_shapes = [(int(x.shape[-2]), int(x.shape[-1])) for x in raw_outputs]
+        assigned = fcos_targets(
+            targets, feature_shapes, self.strides, img_size, self.nc, batch_size,
+            center_radius=self.center_radius)
+
+        lbox = raw_outputs[0].new_tensor(0.0)
+        lcls = raw_outputs[0].new_tensor(0.0)
+        lctr = raw_outputs[0].new_tensor(0.0)
+        positive_per_level = []
+
+        for level, (raw, stride, target) in enumerate(zip(raw_outputs, self.strides, assigned)):
+            bs, _, height, width = raw.shape
+            pred = raw.permute(0, 2, 3, 1).reshape(bs, -1, self.nc + 5)
+            labels = target['labels']
+            pos_mask = target['pos_mask']
+            pos_count = int(pos_mask.sum().item())
+            positive_per_level.append(pos_count)
+
+            cls_target = torch.full_like(pred[..., 5:], self.cn)
+            if pos_count:
+                pos_cls = cls_target[pos_mask]
+                pos_cls[torch.arange(pos_count, device=raw.device), labels[pos_mask]] = self.cp
+                cls_target[pos_mask] = pos_cls
+            lcls = lcls + self.BCEcls(pred[..., 5:], cls_target)
+
+            ctr_target = target['centerness']
+            lctr = lctr + self.BCEctr(pred[..., 4], ctr_target)
+
+            if pos_count:
+                locations = self._locations(height, width, stride, raw.device)
+                loc = locations.unsqueeze(0).expand(bs, -1, 2)[pos_mask]
+                pred_ltrb = F.relu(pred[..., :4][pos_mask]) * stride
+                true_ltrb = target['ltrb'][pos_mask]
+                pred_boxes = torch.stack((
+                    loc[:, 0] - pred_ltrb[:, 0],
+                    loc[:, 1] - pred_ltrb[:, 1],
+                    loc[:, 0] + pred_ltrb[:, 2],
+                    loc[:, 1] + pred_ltrb[:, 3],
+                ), dim=-1)
+                true_boxes = torch.stack((
+                    loc[:, 0] - true_ltrb[:, 0],
+                    loc[:, 1] - true_ltrb[:, 1],
+                    loc[:, 0] + true_ltrb[:, 2],
+                    loc[:, 1] + true_ltrb[:, 3],
+                ), dim=-1)
+                if self.loss_box == 'ciou':
+                    iou = box_ciou(pred_boxes, true_boxes).diag().clamp(-1.0, 1.0)
+                else:
+                    iou = box_giou(pred_boxes, true_boxes).diag().clamp(-1.0, 1.0)
+                lbox = lbox + (1.0 - iou).sum()
+
+        positives = max(sum(positive_per_level), 1)
+        self.last_positive_count = sum(positive_per_level)
+        self.last_stats = {
+            'fcos_positive_count': int(self.last_positive_count),
+            'fcos_positive_per_level': [int(x) for x in positive_per_level],
+            'fcos_loss_box': float((lbox / positives).detach().cpu()),
+            'fcos_loss_cls': float((lcls / positives).detach().cpu()),
+            'fcos_loss_ctr': float((lctr / positives).detach().cpu()),
+        }
+
+        lbox = lbox / positives
+        lcls = lcls / positives
+        lctr = lctr / positives
+        loss = lbox * self.hyp.get('box', 0.05) + lcls * self.hyp.get('cls', 0.3) + lctr * self.hyp.get('ctr', 1.0)
+        loss_items = torch.stack((lbox.detach(), lctr.detach(), lcls.detach(), loss.detach()))
+        return loss * batch_size, loss_items
+
+    @staticmethod
+    def _locations(height, width, stride, device):
+        y, x = torch.meshgrid(torch.arange(height, device=device), torch.arange(width, device=device))
+        return torch.stack(((x + 0.5) * stride, (y + 0.5) * stride), dim=-1).view(-1, 2)
+
+
+class ComputeLossHybrid:
+    def __init__(self, anchor_loss, fcos_loss, lambda_free=1.0):
+        self.anchor_loss = anchor_loss
+        self.fcos_loss = fcos_loss
+        self.lambda_free = float(lambda_free)
+        self.last_positive_count = 0
+        self.last_stats = {}
+
+    def __call__(self, predictions, targets, imgs=None):
+        anchor_pred = predictions['anchor'] if isinstance(predictions, dict) else predictions
+        fcos_pred = predictions['fcos'] if isinstance(predictions, dict) else predictions
+        try:
+            anchor_loss, anchor_items = self.anchor_loss(anchor_pred, targets, imgs)
+        except TypeError:
+            anchor_loss, anchor_items = self.anchor_loss(anchor_pred, targets)
+        fcos_loss, fcos_items = self.fcos_loss(fcos_pred, targets, imgs)
+        loss = anchor_loss + self.lambda_free * fcos_loss
+        items = anchor_items.clone()
+        items[:3] = items[:3] + self.lambda_free * fcos_items[:3]
+        if items.numel() >= 4:
+            items[3] = loss.detach()
+        self.last_positive_count = (
+            int(getattr(self.anchor_loss, 'last_positive_count', 0)) +
+            int(getattr(self.fcos_loss, 'last_positive_count', 0))
+        )
+        self.last_stats = getattr(self.fcos_loss, 'last_stats', {})
+        return loss, items
 
 
 class BCEBlurWithLogitsLoss(nn.Module):

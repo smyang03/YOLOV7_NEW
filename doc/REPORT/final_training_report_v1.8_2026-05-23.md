@@ -2,8 +2,8 @@
 
 ## 실행 요약
 
-- sequence_dir: runs\train_seq\coco128_actual_e10_stage00_02
-- total_stages: 11
+- sequence_dir: runs\tmp_141_sequence\coco128_stage00_08_e3_retry
+- total_stages: 9
 - blockers: 0
 
 ## Stage별 결정표
@@ -19,8 +19,6 @@
 | 06 cctv_pixel_aug | l | keep | COCO128 quick run passed. Artifacts generated. |
 | 07 patch_paste_hard_negative | l | keep | COCO128 quick run passed. Artifacts generated. |
 | 08 weighted_sampler | l | keep | COCO128 quick run passed. Artifacts generated. |
-| 12 optional_gate | l | defer | deferred optional stage |
-| 13 finetune_continual | l | defer | deferred optional stage |
 
 ## 유지
 

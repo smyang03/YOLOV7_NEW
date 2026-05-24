@@ -1,0 +1,12 @@
+# YOLOv7-W6 1.4.1 P2 FCOS hybrid experiment.
+base: ../deploy/yolov7-w6.yaml
+det_head: hybrid
+anchor_free_levels: p2
+p2_head: anchor
+neck_mod: none
+psa_level: none
+fcos:
+  center_radius: 1.5
+  score_mode: sqrt_cls_centerness
+  loss_box: giou
+  lambda_free: 1.0

@@ -116,7 +116,13 @@ def test(data,
 
             # Compute loss
             if compute_loss:
-                loss += compute_loss([x.float() for x in train_out], targets)[1][:3]  # box, obj, cls
+                if isinstance(train_out, dict):
+                    loss += compute_loss(train_out, targets, img)[1][:3]  # box, obj/ctr, cls
+                else:
+                    try:
+                        loss += compute_loss([x.float() for x in train_out], targets, img)[1][:3]  # box, obj, cls
+                    except TypeError:
+                        loss += compute_loss([x.float() for x in train_out], targets)[1][:3]  # box, obj, cls
 
             # Run NMS
             targets[:, 2:] *= torch.Tensor([width, height, width, height]).to(device)  # to pixels

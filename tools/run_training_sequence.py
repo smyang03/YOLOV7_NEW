@@ -47,6 +47,9 @@ STAGES = [
     StageSpec('11', 'w6_p2_anchor_scdown', {'p2-head': 'anchor', 'neck-mod': 'scdown'}, families='w6', train_type='model_family_export'),
     StageSpec('12', 'optional_gate', {}, defer=True, train_type='optional_gate'),
     StageSpec('13', 'finetune_continual', {}, defer=True, train_type='finetune_distill'),
+    StageSpec('14', 'w6_p2_fcos_hybrid', {'det-head': 'hybrid', 'anchor-free-levels': 'p2'}, families='w6', train_type='anchor_free'),
+    StageSpec('15', 'l_fcos_full', {'det-head': 'fcos', 'anchor-free-levels': 'p3p4p5'}, families='l', train_type='anchor_free'),
+    StageSpec('16', 'w6_fcos_full', {'det-head': 'fcos', 'anchor-free-levels': 'p2p3p4p5p6'}, families='w6', train_type='anchor_free'),
 ]
 
 
@@ -163,6 +166,12 @@ def build_train_command(opt, config, family):
         command.append('--image-weights')
     if getattr(opt, 'multi_scale', False):
         command.append('--multi-scale')
+    if getattr(opt, 'save_best_only', False):
+        command.append('--save-best-only')
+    for phase_arg in ('phase1_epochs', 'phase2_epochs', 'phase3_epochs'):
+        value = getattr(opt, phase_arg, None)
+        if value is not None:
+            command.extend([f'--{phase_arg.replace("_", "-")}', str(value)])
     if getattr(opt, 'progress_log_interval', None) is not None:
         command.extend(['--progress-log-interval', str(opt.progress_log_interval)])
     if getattr(opt, 'debug_log', 'off') != 'off':
@@ -697,6 +706,14 @@ if __name__ == '__main__':
     parser.add_argument('--sync-bn', action='store_true', help='pass SyncBatchNorm flag to each training stage')
     parser.add_argument('--image-weights', action='store_true', help='pass image-weights flag to each training stage')
     parser.add_argument('--multi-scale', action='store_true', help='pass multi-scale flag to each training stage')
+    parser.add_argument('--save-best-only', action='store_true',
+                        help='pass save-best-only flag to each training stage')
+    parser.add_argument('--phase1-epochs', type=int, default=None,
+                        help='pass phase1 epoch count to each training stage')
+    parser.add_argument('--phase2-epochs', type=int, default=None,
+                        help='pass phase2 epoch count to each training stage')
+    parser.add_argument('--phase3-epochs', type=int, default=None,
+                        help='pass phase3 epoch count to each training stage')
     parser.add_argument('--launcher', choices=['none', 'distributed'], default='none',
                         help='run each stage command directly or through torch.distributed.launch')
     parser.add_argument('--nproc-per-node', '--nproc_per_node', dest='nproc_per_node', type=int, default=1)

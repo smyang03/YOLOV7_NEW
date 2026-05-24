@@ -9,6 +9,7 @@ import yaml
 sys.path.append('./')  # to run '$ python *.py' files in subdirectories
 logger = logging.getLogger(__name__)
 import torch
+import torch.nn.functional as F
 from models.common import *
 from models.experimental import *
 from utils.autoanchor import check_anchor_order
@@ -135,6 +136,9 @@ def load_model_yaml(cfg):
     merged['p2_head'] = data.get('p2_head', 'none')
     merged['neck_mod'] = neck_mod or 'none'
     merged['psa_level'] = data.get('psa_level', 'none')
+    merged['det_head'] = data.get('det_head', merged.get('det_head', 'anchor'))
+    merged['anchor_free_levels'] = data.get('anchor_free_levels', merged.get('anchor_free_levels', 'p3p4p5'))
+    merged['fcos'] = data.get('fcos', merged.get('fcos', {}))
     return merged
 
 
@@ -261,6 +265,88 @@ class DecoupledDetect(Detect):
     def initialize_biases(self, cf=None):
         for mi, s in zip(self.m, self.stride):
             mi.initialize_biases(s, cf)
+
+
+def _fcos_level_count(levels, total):
+    if levels == 'p2':
+        return min(1, total)
+    if levels == 'p3p4p5':
+        return min(3, total)
+    if levels == 'p2p3p4p5p6':
+        return min(5, total)
+    return total
+
+
+class FCOSDetect(nn.Module):
+    stride = None
+    export = False
+    end2end = False
+    include_nms = False
+    concat = False
+
+    def __init__(self, nc=80, levels='p3p4p5', score_mode='sqrt_cls_centerness', ch=()):  # anchor-free detection layer
+        super().__init__()
+        if isinstance(levels, (list, tuple)) and not ch:
+            ch, levels = levels, 'p3p4p5'
+        if isinstance(score_mode, (list, tuple)) and not ch:
+            ch, score_mode = score_mode, 'sqrt_cls_centerness'
+        level_count = _fcos_level_count(levels, len(ch))
+        ch = ch[:level_count]
+        self.nc = nc
+        self.no = nc + 5  # l, t, r, b, centerness, classes
+        self.levels = levels
+        self.score_mode = score_mode
+        self.nl = len(ch)
+        self.na = 1
+        self.grid = [torch.zeros(1)] * self.nl
+        self.m = nn.ModuleList(nn.Conv2d(x, self.no, 1) for x in ch)
+
+    def forward(self, x):
+        z = []
+        raw = []
+        self.training |= self.export
+        for i in range(self.nl):
+            y = self.m[i](x[i])
+            raw.append(y)
+            if not self.training:
+                bs, _, ny, nx = y.shape
+                if self.grid[i].shape[2:4] != y.shape[2:4]:
+                    self.grid[i] = self._make_grid(nx, ny).to(y.device)
+                p = y.permute(0, 2, 3, 1).contiguous()
+                distances = F.relu(p[..., :4]) * self.stride[i]
+                center = (self.grid[i].view(1, ny, nx, 2) + 0.5) * self.stride[i]
+                x1 = center[..., 0] - distances[..., 0]
+                y1 = center[..., 1] - distances[..., 1]
+                x2 = center[..., 0] + distances[..., 2]
+                y2 = center[..., 1] + distances[..., 3]
+                xywh = torch.stack((
+                    (x1 + x2) * 0.5,
+                    (y1 + y2) * 0.5,
+                    (x2 - x1).clamp(min=0.0),
+                    (y2 - y1).clamp(min=0.0),
+                ), dim=-1)
+                centerness = p[..., 4:5].sigmoid()
+                cls = p[..., 5:].sigmoid()
+                if self.score_mode == 'sqrt_cls_centerness':
+                    obj = centerness.sqrt()
+                    cls = cls.sqrt()
+                else:
+                    obj = centerness
+                z.append(torch.cat((xywh, obj, cls), dim=-1).view(bs, -1, self.no))
+
+        return raw if self.training else (torch.cat(z, 1), raw)
+
+    @staticmethod
+    def _make_grid(nx=20, ny=20):
+        yv, xv = torch.meshgrid([torch.arange(ny), torch.arange(nx)])
+        return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
+
+    def initialize_biases(self, cf=None):
+        for mi, s in zip(self.m, self.stride):
+            b = mi.bias.view(-1)
+            b.data[4] += math.log(8 / (640 / s) ** 2)
+            b.data[5:] += math.log(0.6 / (self.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())
+            mi.bias = torch.nn.Parameter(b, requires_grad=True)
 
 
 class IDetect(nn.Module):
@@ -663,6 +749,66 @@ class DecoupledAuxDetect(nn.Module):
         return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
 
 
+class HybridDetect(nn.Module):
+    stride = None
+    export = False
+    end2end = False
+    include_nms = False
+    concat = False
+
+    def __init__(self, nc=80, anchors=(), base_module='IDetect', levels='p2',
+                 score_mode='sqrt_cls_centerness', ch=()):
+        super().__init__()
+        self.nc = nc
+        self.no = nc + 5
+        self.nl = len(anchors)
+        self.na = len(anchors[0]) // 2
+        self.base_module = base_module
+        self.anchor_free_levels = levels
+        self.fcos_score_mode = score_mode
+        if base_module == 'Detect':
+            self.anchor = Detect(nc, anchors, ch)
+        elif base_module == 'DecoupledDetect':
+            self.anchor = DecoupledDetect(nc, anchors, ch)
+        elif base_module == 'IAuxDetect':
+            self.anchor = IAuxDetect(nc, anchors, ch)
+        elif base_module == 'DecoupledAuxDetect':
+            self.anchor = DecoupledAuxDetect(nc, anchors, ch)
+        else:
+            self.anchor = IDetect(nc, anchors, ch)
+        self.fcos = FCOSDetect(nc, levels, score_mode, ch[:self.nl])
+
+    @property
+    def anchors(self):
+        return self.anchor.anchors
+
+    @property
+    def anchor_grid(self):
+        return self.anchor.anchor_grid
+
+    def forward(self, x):
+        anchor_input = list(x)
+        fcos_input = list(x[:self.fcos.nl])
+        anchor_out = self.anchor(anchor_input)
+        fcos_out = self.fcos(fcos_input)
+        if self.training:
+            return {'anchor': anchor_out, 'fcos': fcos_out}
+        anchor_pred, anchor_train = anchor_out
+        fcos_pred, fcos_raw = fcos_out
+        return torch.cat((anchor_pred, fcos_pred), 1), {'anchor': anchor_train, 'fcos': fcos_raw}
+
+    def initialize_biases(self, cf=None):
+        if hasattr(self.anchor, 'initialize_biases'):
+            self.anchor.initialize_biases(cf)
+        else:
+            for mi, s in zip(self.anchor.m, self.anchor.stride):
+                b = mi.bias.view(self.na, -1)
+                b.data[:, 4] += math.log(8 / (640 / s) ** 2)
+                b.data[:, 5:] += math.log(0.6 / (self.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())
+                mi.bias = torch.nn.Parameter(b.view(-1), requires_grad=True)
+        self.fcos.initialize_biases(cf)
+
+
 class IBin(nn.Module):
     stride = None  # strides computed during build
     export = False  # onnx export
@@ -739,7 +885,8 @@ class IBin(nn.Module):
 
 
 class Model(nn.Module):
-    def __init__(self, cfg='yolor-csp-c.yaml', ch=3, nc=None, anchors=None, head='coupled'):  # model, input channels, number of classes
+    def __init__(self, cfg='yolor-csp-c.yaml', ch=3, nc=None, anchors=None, head='coupled',
+                 det_head=None, anchor_free_levels=None, fcos_score_mode=None):  # model, input channels, number of classes
         super(Model, self).__init__()
         self.traced = False
         self.head = head
@@ -757,7 +904,11 @@ class Model(nn.Module):
         if anchors:
             logger.info(f'Overriding model.yaml anchors with anchors={anchors}')
             self.yaml['anchors'] = round(anchors)  # override yaml value
+        self.det_head = det_head or self.yaml.get('det_head', 'anchor')
+        self.anchor_free_levels = anchor_free_levels or self.yaml.get('anchor_free_levels', 'p3p4p5')
+        self.fcos_score_mode = fcos_score_mode or self.yaml.get('fcos', {}).get('score_mode', 'sqrt_cls_centerness')
         self._apply_head_override(head)
+        self._apply_det_head_override(self.det_head)
         self.model, self.save = parse_model(deepcopy(self.yaml), ch=[ch])  # model, savelist
         self.names = [str(i) for i in range(self.yaml['nc'])]  # default names
         # print([x.shape for x in self.forward(torch.zeros(1, ch, 64, 64))])
@@ -789,6 +940,22 @@ class Model(nn.Module):
             self.stride = m.stride
             self._initialize_aux_biases()  # only run once
             # print('Strides: %s' % m.stride.tolist())
+        if isinstance(m, FCOSDetect):
+            s = 256  # 2x min stride
+            m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])
+            self.stride = m.stride
+            self._initialize_fcos_biases()
+        if isinstance(m, HybridDetect):
+            s = 256  # 2x min stride
+            out = self.forward(torch.zeros(1, ch, s, s))
+            anchor_out = out['anchor'] if isinstance(out, dict) else out
+            m.stride = torch.tensor([s / x.shape[-2] for x in anchor_out[:m.nl]])
+            m.anchor.stride = m.stride
+            m.fcos.stride = m.stride[:m.fcos.nl]
+            check_anchor_order(m.anchor)
+            m.anchor.anchors /= m.stride.view(-1, 1, 1)
+            self.stride = m.stride
+            m.initialize_biases()
         if isinstance(m, IBin):
             s = 256  # 2x min stride
             m.stride = torch.tensor([s / x.shape[-2] for x in self.forward(torch.zeros(1, ch, s, s))])  # forward
@@ -845,6 +1012,43 @@ class Model(nn.Module):
                 return
         raise ValueError('--head decoupled requires a Detect, IDetect, or IAuxDetect module in model yaml')
 
+    def _apply_det_head_override(self, det_head):
+        if det_head in (None, 'anchor'):
+            self.yaml['det_head'] = 'anchor'
+            return
+        if det_head not in ('fcos', 'hybrid'):
+            raise ValueError(f'Unsupported det_head option: {det_head}')
+        for layer in reversed(self.yaml.get('head', [])):
+            module = layer[2]
+            module_name = module if isinstance(module, str) else getattr(module, '__name__', str(module))
+            if module_name in ('Detect', 'IDetect', 'DecoupledDetect'):
+                if det_head == 'fcos':
+                    layer[2] = 'FCOSDetect'
+                    layer[3] = ['nc', f"'{self.anchor_free_levels}'", f"'{self.fcos_score_mode}'"]
+                else:
+                    layer[2] = 'HybridDetect'
+                    layer[3] = ['nc', 'anchors', f"'{module_name}'", f"'{self.anchor_free_levels}'",
+                                f"'{self.fcos_score_mode}'"]
+                self.yaml['det_head'] = det_head
+                self.yaml['anchor_free_levels'] = self.anchor_free_levels
+                logger.info(f'Using {det_head} detection head override')
+                return
+            if module_name in ('IAuxDetect', 'DecoupledAuxDetect'):
+                if det_head == 'fcos':
+                    if isinstance(layer[0], list) and len(layer[0]) % 2 == 0:
+                        layer[0] = layer[0][:len(layer[0]) // 2]
+                    layer[2] = 'FCOSDetect'
+                    layer[3] = ['nc', f"'{self.anchor_free_levels}'", f"'{self.fcos_score_mode}'"]
+                else:
+                    layer[2] = 'HybridDetect'
+                    layer[3] = ['nc', 'anchors', f"'{module_name}'", f"'{self.anchor_free_levels}'",
+                                f"'{self.fcos_score_mode}'"]
+                self.yaml['det_head'] = det_head
+                self.yaml['anchor_free_levels'] = self.anchor_free_levels
+                logger.info(f'Using {det_head} detection head override')
+                return
+        raise ValueError('--det-head fcos|hybrid requires a Detect, IDetect, or IAuxDetect module in model yaml')
+
     def forward(self, x, augment=False, profile=False):
         if augment:
             img_size = x.shape[-2:]  # height, width
@@ -875,11 +1079,11 @@ class Model(nn.Module):
                 self.traced=False
 
             if self.traced:
-                if isinstance(m, Detect) or isinstance(m, IDetect) or isinstance(m, IAuxDetect) or isinstance(m, DecoupledAuxDetect) or isinstance(m, IKeypoint):
+                if isinstance(m, Detect) or isinstance(m, IDetect) or isinstance(m, IAuxDetect) or isinstance(m, DecoupledAuxDetect) or isinstance(m, FCOSDetect) or isinstance(m, HybridDetect) or isinstance(m, IKeypoint):
                     break
 
             if profile:
-                c = isinstance(m, (Detect, IDetect, IAuxDetect, DecoupledAuxDetect, IBin))
+                c = isinstance(m, (Detect, IDetect, IAuxDetect, DecoupledAuxDetect, FCOSDetect, HybridDetect, IBin))
                 o = thop.profile(m, inputs=(x.copy() if c else x,), verbose=False)[0] / 1E9 * 2 if thop else 0  # FLOPS
                 for _ in range(10):
                     m(x.copy() if c else x)
@@ -926,6 +1130,11 @@ class Model(nn.Module):
             b2.data[:, 4] += math.log(8 / (640 / s) ** 2)  # obj (8 objects per 640 image)
             b2.data[:, 5:] += math.log(0.6 / (m.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())  # cls
             mi2.bias = torch.nn.Parameter(b2.view(-1), requires_grad=True)
+
+    def _initialize_fcos_biases(self, cf=None):
+        m = self.model[-1]
+        if hasattr(m, 'initialize_biases'):
+            m.initialize_biases(cf)
 
     def _initialize_biases_bin(self, cf=None):  # initialize biases into Detect(), cf is class frequency
         # https://arxiv.org/abs/1708.02002 section 3.3
@@ -1060,7 +1269,9 @@ def parse_model(d, ch):  # model_dict, input_channels(3)
             c2 = ch[f[0]]
         elif m is Foldcut:
             c2 = ch[f] // 2
-        elif m in [Detect, IDetect, IAuxDetect, DecoupledDetect, DecoupledAuxDetect, IBin, IKeypoint]:
+        elif m in [FCOSDetect]:
+            args.append([ch[x] for x in f])
+        elif m in [Detect, IDetect, IAuxDetect, DecoupledDetect, DecoupledAuxDetect, HybridDetect, IBin, IKeypoint]:
             args.append([ch[x] for x in f])
             if isinstance(args[1], int):  # number of anchors
                 args[1] = [list(range(args[1] * 2))] * len(f)

@@ -49,6 +49,11 @@ def flatten_tensors(output):
         for item in output:
             tensors.extend(flatten_tensors(item))
         return tensors
+    if isinstance(output, dict):
+        tensors = []
+        for item in output.values():
+            tensors.extend(flatten_tensors(item))
+        return tensors
     return []
 
 
@@ -111,6 +116,8 @@ def main(opt):
         'weights': opt.weights,
         'cfg': opt.cfg,
         'p2_head': model_yaml.get('p2_head', 'none'),
+        'det_head': model_yaml.get('det_head', 'anchor'),
+        'anchor_free_levels': model_yaml.get('anchor_free_levels', 'p3p4p5'),
         'neck_mod': model_yaml.get('neck_mod', 'none'),
         'psa_level': model_yaml.get('psa_level', 'none'),
         'optional_experiment': optional_experiment,
@@ -130,6 +137,7 @@ def main(opt):
         'gflops_delta_percent': ((gflops - opt.baseline_gflops) / opt.baseline_gflops * 100.0)
         if gflops is not None and opt.baseline_gflops else None,
         'total_boxes': int(total_boxes),
+        'fcos_candidate_count': int(total_boxes) if model_yaml.get('det_head') in ('fcos', 'hybrid') else 0,
         'per_level_boxes': per_level,
         'output_shapes': output_shapes,
         'activation_memory_mb': activation_memory_mb,

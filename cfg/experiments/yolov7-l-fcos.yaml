@@ -1,0 +1,12 @@
+# YOLOv7-L 1.4.1 full FCOS experiment.
+base: ../training/yolov7.yaml
+det_head: fcos
+anchor_free_levels: p3p4p5
+p2_head: none
+neck_mod: none
+psa_level: none
+fcos:
+  center_radius: 1.5
+  score_mode: sqrt_cls_centerness
+  loss_box: giou
+  lambda_free: 1.0

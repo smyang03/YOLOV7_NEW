@@ -38,6 +38,9 @@ if __name__ == '__main__':
     parser.add_argument('--fp16', action='store_true', help='CoreML FP16 half-precision export')
     parser.add_argument('--int8', action='store_true', help='CoreML INT8 quantization')
     parser.add_argument('--gopnms', action='store_true', help='CoreML INT8 quantization')
+    parser.add_argument('--det-head', choices=['anchor', 'fcos', 'hybrid'], default='anchor',
+                        help='metadata option for anchor-free exports; weights define the actual head')
+    parser.add_argument('--anchor-free-levels', choices=['p2', 'p3p4p5', 'p2p3p4p5p6'], default='p3p4p5')
     opt = parser.parse_args()
     if opt.nms_mode == 'end2end':
         opt.end2end = True

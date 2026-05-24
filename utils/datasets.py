@@ -94,26 +94,80 @@ def create_dataloader(path, imgsz, batch_size, stride, opt, hyp=None, augment=Fa
 
     batch_size = min(batch_size, len(dataset))
     nw = min([os.cpu_count() // world_size, batch_size if batch_size > 1 else 0, workers])  # number of workers
+    rect_ddp = getattr(dataset, 'rect', False) and rank != -1 and sampler_mode != 'weighted' and not image_weights
+    batch_sampler = None
     if sampler_mode == 'weighted':
         if image_weights:
             raise ValueError('--sampler-mode weighted cannot be used with --image-weights')
         nc = int(getattr(opt, 'nc', 0) or max((x[:, 0].max() if len(x) else 0 for x in dataset.labels), default=0) + 1)
         sampler = build_weighted_sampler(dataset, nc, rank=rank, world_size=world_size, seed=getattr(opt, 'seed', 0), hyp=hyp)
+    elif rect_ddp:
+        sampler = None
+        batch_sampler = RectDistributedBatchSampler(
+            dataset, batch_size=batch_size, rank=rank, world_size=world_size,
+            seed=getattr(opt, 'seed', 0), shuffle=True)
     else:
         sampler = torch.utils.data.distributed.DistributedSampler(dataset) if rank != -1 else None
     loader = torch.utils.data.DataLoader if image_weights or close_mosaic or sampler_mode == 'weighted' else InfiniteDataLoader
     persistent_workers = nw > 0 and not close_mosaic
     
     # Use torch.utils.data.DataLoader() if dataset.properties will update during training else InfiniteDataLoader()
-    dataloader = loader(dataset,
-                        batch_size=batch_size,
-                        num_workers=nw,
-                        sampler=sampler,
-                        pin_memory=True,
-                        persistent_workers=persistent_workers,
-                        collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
+    loader_kwargs = dict(
+        num_workers=nw,
+        pin_memory=True,
+        persistent_workers=persistent_workers,
+        collate_fn=LoadImagesAndLabels.collate_fn4 if quad else LoadImagesAndLabels.collate_fn)
+    if batch_sampler is not None:
+        dataloader = loader(dataset, batch_sampler=batch_sampler, **loader_kwargs)
+    else:
+        dataloader = loader(dataset,
+                            batch_size=batch_size,
+                            sampler=sampler,
+                            **loader_kwargs)
     return dataloader, dataset
 
+
+
+class RectDistributedBatchSampler(torch.utils.data.Sampler):
+    """Distribute contiguous rectangular batches without mixing shapes inside a batch."""
+
+    def __init__(self, dataset, batch_size, rank=0, world_size=1, seed=0, shuffle=True):
+        if rank < 0:
+            raise ValueError('RectDistributedBatchSampler requires a distributed rank')
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.rank = int(rank)
+        self.world_size = int(world_size)
+        self.seed = int(seed)
+        self.shuffle = bool(shuffle)
+        self.epoch = 0
+        self.num_batches = int(math.ceil(len(dataset) / self.batch_size))
+        self.num_samples = int(math.ceil(self.num_batches / self.world_size))
+        self.total_batches = self.num_samples * self.world_size
+
+    def __iter__(self):
+        batch_ids = list(range(self.num_batches))
+        if self.shuffle:
+            generator = torch.Generator()
+            generator.manual_seed(self.seed + self.epoch)
+            order = torch.randperm(len(batch_ids), generator=generator).tolist()
+            batch_ids = [batch_ids[i] for i in order]
+        if len(batch_ids) < self.total_batches:
+            batch_ids += batch_ids[:self.total_batches - len(batch_ids)]
+
+        for batch_id in batch_ids[self.rank:self.total_batches:self.world_size]:
+            start = batch_id * self.batch_size
+            end = min(start + self.batch_size, len(self.dataset))
+            batch = list(range(start, end))
+            if batch and len(batch) < self.batch_size:
+                batch += batch[:self.batch_size - len(batch)]
+            yield batch
+
+    def __len__(self):
+        return self.num_samples
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch)
 
 
 class InfiniteDataLoader(torch.utils.data.dataloader.DataLoader):
@@ -148,6 +202,10 @@ class _RepeatSampler(object):
     def __iter__(self):
         while True:
             yield from iter(self.sampler)
+
+    def set_epoch(self, epoch):
+        if hasattr(self.sampler, 'set_epoch'):
+            self.sampler.set_epoch(epoch)
 
 class LoadImagestxt:
     def __init__(self, pathtxt, img_size=640, stride=32):
