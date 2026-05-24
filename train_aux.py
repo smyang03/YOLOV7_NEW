@@ -485,7 +485,8 @@ def train(hyp, opt, device, tb_writer=None):
                 f'Using {dataloader.num_workers} dataloader workers\n'
                 f'Logging results to {save_dir}\n'
                 f'Starting training for {epochs} epochs...')
-    torch.save(model, wdir / 'init.pt')
+    if not getattr(opt, 'save_best_only', False):
+        torch.save(model, wdir / 'init.pt')
     for epoch in range(start_epoch, epochs):  # epoch ------------------------------------------------------------------
         epoch_start_time = time.time()
         stop_training = False
@@ -560,6 +561,8 @@ def train(hyp, opt, device, tb_writer=None):
         epoch_positive_count = 0
         if hasattr(getattr(dataloader, 'sampler', None), 'set_epoch'):
             dataloader.sampler.set_epoch(epoch)
+        if hasattr(getattr(dataloader, 'batch_sampler', None), 'set_epoch'):
+            dataloader.batch_sampler.set_epoch(epoch)
         pbar = enumerate(dataloader)
         logger.info(('\n' + '%10s' * 8) % ('Epoch', 'gpu_mem', 'box', 'obj', 'cls', 'total', 'labels', 'img_size'))
         if rank in [-1, 0]:
@@ -755,25 +758,32 @@ def train(hyp, opt, device, tb_writer=None):
                         'loss_state': build_loss_state(opt, compute_loss_ota),
                         'mosaic_active': dataset.mosaic}
                 # Save last, best and delete
-                if opt.model_saveoptimizer:
+                save_best_only = getattr(opt, 'save_best_only', False)
+                save_current_best = best_fitness == fi
+                if save_best_only:
+                    if save_current_best or (final_epoch and not best.is_file()):
+                        torch.save(ckpt, best)
+                        if opt.model_saveoptimizer:
+                            strip_optimizer(best)
+                elif opt.model_saveoptimizer:
                     # optimizer 제거하고 저장 (가벼운 모델만)
                     torch.save(ckpt, last)
                     torch.save(ckpt, wdir / 'epoch_{:03d}.pt'.format(epoch))
-                    if best_fitness == fi:
+                    if save_current_best:
                         torch.save(ckpt, wdir / 'best_{:03d}.pt'.format(epoch))
                         torch.save(ckpt, best)
                     
                     # 저장 후 optimizer 제거
                     strip_optimizer(last)
                     strip_optimizer(wdir / 'epoch_{:03d}.pt'.format(epoch))
-                    if best_fitness == fi:
+                    if save_current_best:
                         strip_optimizer(wdir / 'best_{:03d}.pt'.format(epoch))
                         strip_optimizer(best)
                 else:
                     # optimizer 포함해서 저장 (원본 ckpt 그대로)
                     torch.save(ckpt, last)
                     torch.save(ckpt, wdir / 'epoch_{:03d}.pt'.format(epoch))
-                    if best_fitness == fi:
+                    if save_current_best:
                         torch.save(ckpt, wdir / 'best_{:03d}.pt'.format(epoch))
                         torch.save(ckpt, best)
 
@@ -799,7 +809,8 @@ def train(hyp, opt, device, tb_writer=None):
         # Test best.pt
         logger.info('%g epochs completed in %.3f hours.\n' % (epoch - start_epoch + 1, (time.time() - t0) / 3600))
         if opt.data.endswith('coco.yaml') and nc == 80:  # if COCO
-            for m in (last, best) if best.exists() else (last,):  # speed, mAP tests
+            test_weights = [x for x in (last, best) if x.exists()]
+            for m in test_weights:  # speed, mAP tests
                 results, _, _, _ = test.test(opt.data,
                                              batch_size=batch_size * 2,
                                              imgsz=imgsz_test,
@@ -892,6 +903,8 @@ if __name__ == '__main__':
     parser.add_argument('--rect', action='store_true', help='rectangular training')
     parser.add_argument('--resume', nargs='?', const=True, default=False, help='resume most recent training')
     parser.add_argument('--nosave', action='store_true', help='only save final checkpoint')
+    parser.add_argument('--save-best-only', action='store_true',
+                        help='save/update weights/best.pt only; skip last.pt and epoch_*.pt checkpoints')
     parser.add_argument('--notest', action='store_true', help='only test final epoch')
     parser.add_argument('--noautoanchor', action='store_true', help='disable autoanchor check')
     parser.add_argument('--evolve', action='store_true', help='evolve hyperparameters')

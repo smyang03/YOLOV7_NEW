@@ -84,9 +84,12 @@ def quick_stage_overrides(spec, opt):
     epochs = opt.epochs
     if opt.dataset_profile == 'coco128_quick' and spec.stage_id == '01':
         phase_img = opt.img if len(opt.img) == 2 else [opt.img[0], opt.img[0]]
-        flags.setdefault('phase1-epochs', 1)
-        flags.setdefault('phase2-epochs', 1)
-        flags.setdefault('phase3-epochs', 1)
+        if getattr(opt, 'phase1_epochs', None) is None:
+            flags.setdefault('phase1-epochs', 1)
+        if getattr(opt, 'phase2_epochs', None) is None:
+            flags.setdefault('phase2-epochs', 1)
+        if getattr(opt, 'phase3_epochs', None) is None:
+            flags.setdefault('phase3-epochs', 1)
         flags.setdefault('phase2-img', phase_img)
         flags.setdefault('phase3-img', phase_img)
         epochs = max(epochs, 3)
@@ -163,6 +166,12 @@ def build_train_command(opt, config, family):
         command.append('--image-weights')
     if getattr(opt, 'multi_scale', False):
         command.append('--multi-scale')
+    if getattr(opt, 'save_best_only', False):
+        command.append('--save-best-only')
+    for phase_arg in ('phase1_epochs', 'phase2_epochs', 'phase3_epochs'):
+        value = getattr(opt, phase_arg, None)
+        if value is not None:
+            command.extend([f'--{phase_arg.replace("_", "-")}', str(value)])
     if getattr(opt, 'progress_log_interval', None) is not None:
         command.extend(['--progress-log-interval', str(opt.progress_log_interval)])
     if getattr(opt, 'debug_log', 'off') != 'off':
@@ -697,6 +706,14 @@ if __name__ == '__main__':
     parser.add_argument('--sync-bn', action='store_true', help='pass SyncBatchNorm flag to each training stage')
     parser.add_argument('--image-weights', action='store_true', help='pass image-weights flag to each training stage')
     parser.add_argument('--multi-scale', action='store_true', help='pass multi-scale flag to each training stage')
+    parser.add_argument('--save-best-only', action='store_true',
+                        help='pass save-best-only flag to each training stage')
+    parser.add_argument('--phase1-epochs', type=int, default=None,
+                        help='pass phase1 epoch count to each training stage')
+    parser.add_argument('--phase2-epochs', type=int, default=None,
+                        help='pass phase2 epoch count to each training stage')
+    parser.add_argument('--phase3-epochs', type=int, default=None,
+                        help='pass phase3 epoch count to each training stage')
     parser.add_argument('--launcher', choices=['none', 'distributed'], default='none',
                         help='run each stage command directly or through torch.distributed.launch')
     parser.add_argument('--nproc-per-node', '--nproc_per_node', dest='nproc_per_node', type=int, default=1)
