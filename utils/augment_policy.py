@@ -58,8 +58,6 @@ def validate_aug_options(opt, parser=None):
     message = None
     if opt.sampler_mode == 'weighted' and getattr(opt, 'image_weights', False):
         message = '--sampler-mode weighted cannot be used with --image-weights'
-    if opt.sampler_mode == 'weighted' and int(getattr(opt, 'world_size', 1)) > 1:
-        message = '--sampler-mode weighted is single-GPU only until a distributed-aware sampler is implemented'
     if message:
         if parser is not None:
             parser.error(message)
