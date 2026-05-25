@@ -951,6 +951,8 @@ if __name__ == '__main__':
     parser.add_argument('--profile', choices=['off', 'on'], default='off')
     parser.add_argument('--per-class-log-interval', type=int, default=10)
     parser.add_argument('--log-format', choices=['txt', 'csv', 'both'], default='both')
+    parser.add_argument('--nccl-timeout', type=int, default=14400,
+                        help='NCCL process group timeout in seconds (default: 14400 = 4h)')
     parser.add_argument('--debug-log', choices=['off', 'error', 'debug', 'trace'], default='off')
     parser.add_argument('--debug-log-file', type=str, default='debug_trace.log')
     parser.add_argument('--debug-log-modules', type=str,
@@ -1023,7 +1025,8 @@ if __name__ == '__main__':
         torch.cuda.set_device(opt.local_rank)
         device = torch.device('cuda', opt.local_rank)
         if not dist.is_initialized():
-            dist.init_process_group(backend='nccl', init_method='env://')
+            nccl_timeout = datetime.timedelta(seconds=int(getattr(opt, 'nccl_timeout', 14400)))
+            dist.init_process_group(backend='nccl', init_method='env://', timeout=nccl_timeout)
             print(f'[{opt.local_rank}] Process group initialized')
         opt.batch_size = opt.total_batch_size // opt.world_size
         print(f'[{opt.local_rank}] Setup complete - batch_size: {opt.batch_size}, device: {device}')

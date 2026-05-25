@@ -1107,6 +1107,8 @@ if __name__ == '__main__':
     parser.add_argument('--profile', choices=['off', 'on'], default='off')
     parser.add_argument('--per-class-log-interval', type=int, default=10)
     parser.add_argument('--log-format', choices=['txt', 'csv', 'both'], default='both')
+    parser.add_argument('--nccl-timeout', type=int, default=14400,
+                        help='NCCL process group timeout in seconds (default: 14400 = 4h)')
     parser.add_argument('--debug-log', choices=['off', 'error', 'debug', 'trace'], default='off')
     parser.add_argument('--debug-log-file', type=str, default='debug_trace.log')
     parser.add_argument('--debug-log-modules', type=str,
@@ -1176,7 +1178,8 @@ if __name__ == '__main__':
         assert torch.cuda.device_count() > opt.local_rank
         torch.cuda.set_device(opt.local_rank)
         device = torch.device('cuda', opt.local_rank)
-        dist.init_process_group(backend='nccl', init_method='env://')  # distributed backend
+        nccl_timeout = datetime.timedelta(seconds=int(getattr(opt, 'nccl_timeout', 14400)))
+        dist.init_process_group(backend='nccl', init_method='env://', timeout=nccl_timeout)  # distributed backend
         assert opt.batch_size % opt.world_size == 0, '--batch-size must be multiple of CUDA device count'
         opt.batch_size = opt.total_batch_size // opt.world_size
 

@@ -174,6 +174,8 @@ def build_train_command(opt, config, family):
             command.extend([f'--{phase_arg.replace("_", "-")}', str(value)])
     if getattr(opt, 'progress_log_interval', None) is not None:
         command.extend(['--progress-log-interval', str(opt.progress_log_interval)])
+    if getattr(opt, 'nccl_timeout', 14400) != 14400:
+        command.extend(['--nccl-timeout', str(opt.nccl_timeout)])
     if getattr(opt, 'debug_log', 'off') != 'off':
         command.extend(['--debug-log', opt.debug_log])
         command.extend(['--debug-log-file', opt.debug_log_file])
@@ -727,6 +729,8 @@ if __name__ == '__main__':
                         help='target_full soft fail threshold versus previous success')
     parser.add_argument('--max-gflops-delta-percent', type=float, default=10.0,
                         help='target_full soft fail threshold versus family baseline')
+    parser.add_argument('--nccl-timeout', dest='nccl_timeout', type=int, default=14400,
+                        help='NCCL timeout in seconds passed to each training stage (default: 14400 = 4h)')
     parser.add_argument('--debug-log', choices=['off', 'error', 'debug', 'trace'], default='off')
     parser.add_argument('--debug-log-file', type=str, default='debug_trace.log')
     parser.add_argument('--debug-log-modules', type=str,
