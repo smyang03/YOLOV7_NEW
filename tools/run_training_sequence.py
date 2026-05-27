@@ -168,6 +168,8 @@ def build_train_command(opt, config, family):
         command.append('--multi-scale')
     if getattr(opt, 'save_best_only', False):
         command.append('--save-best-only')
+    if getattr(opt, 'notest', False):
+        command.append('--notest')
     for phase_arg in ('phase1_epochs', 'phase2_epochs', 'phase3_epochs'):
         value = getattr(opt, phase_arg, None)
         if value is not None:
@@ -710,6 +712,8 @@ if __name__ == '__main__':
     parser.add_argument('--multi-scale', action='store_true', help='pass multi-scale flag to each training stage')
     parser.add_argument('--save-best-only', action='store_true',
                         help='pass save-best-only flag to each training stage')
+    parser.add_argument('--notest', action='store_true',
+                        help='pass notest flag to each training stage; train.py validates final epoch only')
     parser.add_argument('--phase1-epochs', type=int, default=None,
                         help='pass phase1 epoch count to each training stage')
     parser.add_argument('--phase2-epochs', type=int, default=None,
