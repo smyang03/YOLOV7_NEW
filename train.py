@@ -34,11 +34,11 @@ from utils.google_utils import attempt_download
 from utils.early_stopping import PhaseEarlyStopping
 from utils.augment_policy import ensure_aug_option_defaults, validate_aug_options
 from utils.debug_logging import get_debug_logger
-from utils.loss import ComputeLoss, ComputeLossOTA
+from utils.loss import ComputeLoss, ComputeLossFCOS, ComputeLossHybrid, ComputeLossOTA
 from utils.continual_loss import DistillationLoss
 from utils.loss_components import apply_loss_options, build_loss_state, ensure_loss_option_defaults, \
     get_loss_positive_count, load_loss_state, validate_loss_options
-from utils.model_options import ensure_structure_option_defaults, validate_structure_options
+from utils.model_options import ensure_structure_option_defaults, validate_anchor_free_options, validate_structure_options
 from utils.phase import PhaseConfig, phase_changed, resolve_phase
 from utils.plots import plot_images, plot_labels, plot_results, plot_evolution
 from utils.sampler import log_sampler_stats
@@ -228,7 +228,10 @@ def train(hyp, opt, device, tb_writer=None):
         ckpt = torch.load(weights, map_location=device)  # load checkpoint
         loss_state_resume = ckpt.get('loss_state')
         model = Model(opt.cfg or ckpt['model'].yaml, ch=3, nc=nc, anchors=hyp.get('anchors'),
-                      head=getattr(opt, 'head', 'coupled')).to(device)  # create
+                      head=getattr(opt, 'head', 'coupled'),
+                      det_head=getattr(opt, 'det_head', 'anchor'),
+                      anchor_free_levels=getattr(opt, 'anchor_free_levels', 'p3p4p5'),
+                      fcos_score_mode=getattr(opt, 'fcos_score_mode', None)).to(device)  # create
         exclude = ['anchor'] if (opt.cfg or hyp.get('anchors')) and not opt.resume else []  # exclude keys
         state_dict = ckpt['model'].float().state_dict()  # to FP32
         state_dict = intersect_dicts(state_dict, model.state_dict(), exclude=exclude)  # intersect
@@ -236,7 +239,10 @@ def train(hyp, opt, device, tb_writer=None):
         logger.info('Transferred %g/%g items from %s' % (len(state_dict), len(model.state_dict()), weights))  # report
     else:
         model = Model(opt.cfg, ch=3, nc=nc, anchors=hyp.get('anchors'),
-                      head=getattr(opt, 'head', 'coupled')).to(device)  # create
+                      head=getattr(opt, 'head', 'coupled'),
+                      det_head=getattr(opt, 'det_head', 'anchor'),
+                      anchor_free_levels=getattr(opt, 'anchor_free_levels', 'p3p4p5'),
+                      fcos_score_mode=getattr(opt, 'fcos_score_mode', None)).to(device)  # create
     with torch_distributed_zero_first(rank):
         check_dataset(data_dict)  # check
     train_path = data_dict['train']
@@ -460,7 +466,7 @@ def train(hyp, opt, device, tb_writer=None):
                     tb_writer.add_histogram('classes', c, 0)
 
             # Anchors
-            if not opt.noautoanchor:
+            if not opt.noautoanchor and getattr(opt, 'det_head', 'anchor') != 'fcos':
                 check_anchors(dataset, model=model, thr=hyp['anchor_t'], imgsz=imgsz)
             model.half().float()  # pre-reduce anchor precision
 
@@ -489,10 +495,23 @@ def train(hyp, opt, device, tb_writer=None):
     results = (0, 0, 0, 0, 0, 0, 0)  # P, R, mAP@.5, mAP@.5-.95, val_loss(box, obj, cls)
     scheduler.last_epoch = start_epoch - 1  # do not move
     scaler = amp.GradScaler(enabled=cuda)
-    compute_loss_ota = ComputeLossOTA(model)  # init loss class
-    compute_loss = ComputeLoss(model)  # init loss class
-    load_loss_state(compute_loss_ota, loss_state_resume, logger)
-    load_loss_state(compute_loss, loss_state_resume, logger)
+    det_head_mode = getattr(opt, 'det_head', 'anchor')
+    compute_loss_ota = None
+    compute_loss_anchor = None
+    anchor_loss_active = None
+    if det_head_mode != 'fcos':
+        compute_loss_ota = ComputeLossOTA(model)  # init loss class
+        compute_loss_anchor = ComputeLoss(model)  # init loss class
+        load_loss_state(compute_loss_ota, loss_state_resume, logger)
+        load_loss_state(compute_loss_anchor, loss_state_resume, logger)
+        anchor_loss_active = compute_loss_ota if ('loss_ota' not in hyp or hyp['loss_ota'] == 1) else compute_loss_anchor
+    if det_head_mode == 'fcos':
+        compute_loss = ComputeLossFCOS(model, hyp=hyp, opt=opt)
+    elif det_head_mode == 'hybrid':
+        compute_loss = ComputeLossHybrid(anchor_loss_active, ComputeLossFCOS(model, hyp=hyp, opt=opt),
+                                         getattr(opt, 'lambda_free', 1.0))
+    else:
+        compute_loss = anchor_loss_active
     early_stopper = PhaseEarlyStopping(
         patience=getattr(opt, 'patience', 20),
         active_phase='phase3',
@@ -613,12 +632,11 @@ def train(hyp, opt, device, tb_writer=None):
             # Forward
             with amp.autocast(enabled=cuda):
                 pred = model(imgs)  # forward
-                if 'loss_ota' not in hyp or hyp['loss_ota'] == 1:
-                    loss, loss_items = compute_loss_ota(pred, targets.to(device), imgs)  # loss scaled by batch_size
-                    active_loss = compute_loss_ota
-                else:
-                    loss, loss_items = compute_loss(pred, targets.to(device))  # loss scaled by batch_size
-                    active_loss = compute_loss
+                try:
+                    loss, loss_items = compute_loss(pred, targets.to(device), imgs)
+                except TypeError:
+                    loss, loss_items = compute_loss(pred, targets.to(device))
+                active_loss = compute_loss
                 if teacher_model is not None:
                     with torch.no_grad():
                         teacher_pred = teacher_model(imgs)
@@ -901,8 +919,7 @@ def train(hyp, opt, device, tb_writer=None):
                         'updates': ema.updates,
                         'optimizer': optimizer.state_dict(),
                         'wandb_id': wandb_logger.wandb_run.id if wandb_logger.wandb else None,
-                        'loss_state': build_loss_state(
-                            opt, compute_loss_ota if ('loss_ota' not in hyp or hyp['loss_ota'] == 1) else compute_loss),
+                        'loss_state': build_loss_state(opt, compute_loss),
                         'mosaic_active': dataset.mosaic}  # mosaic 상태 추가
 
                 # Save last, best and delete
@@ -1117,6 +1134,13 @@ if __name__ == '__main__':
                         help='print rank0 batch progress every N batches; 0 disables')
     parser.add_argument('--no-verbose', action='store_true')
     parser.add_argument('--head', choices=['coupled', 'decoupled'], default='coupled')
+    parser.add_argument('--det-head', choices=['anchor', 'fcos', 'hybrid'], default='anchor')
+    parser.add_argument('--anchor-free-levels', choices=['p2', 'p3p4p5', 'p2p3p4p5p6'], default='p3p4p5')
+    parser.add_argument('--lambda-free', type=float, default=1.0)
+    parser.add_argument('--fcos-center-radius', type=float, default=1.5)
+    parser.add_argument('--fcos-score-mode', choices=['sqrt_cls_centerness', 'mul_cls_centerness'],
+                        default='sqrt_cls_centerness')
+    parser.add_argument('--fcos-loss-box', choices=['giou', 'ciou'], default='giou')
     parser.add_argument('--loss-box', choices=['ciou', 'wiou_v3'], default='ciou')
     parser.add_argument('--assign', choices=['simota', 'tal'], default='simota')
     parser.add_argument('--loss-cls', choices=['bce', 'vfl'], default='bce')
@@ -1133,6 +1157,7 @@ if __name__ == '__main__':
     ensure_aug_option_defaults(opt)
     ensure_structure_option_defaults(opt)
     validate_loss_options(opt, parser)
+    validate_anchor_free_options(opt, parser)
 
     # Set DDP variables
     opt.world_size = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
@@ -1140,6 +1165,7 @@ if __name__ == '__main__':
     set_logging(opt.global_rank)
     validate_aug_options(opt, parser)
     validate_structure_options(opt, parser)
+    validate_anchor_free_options(opt, parser)
     #if opt.global_rank in [-1, 0]:
     #    check_git_status()
     #    check_requirements()
@@ -1158,6 +1184,7 @@ if __name__ == '__main__':
         validate_loss_options(opt, parser)
         validate_aug_options(opt, parser)
         validate_structure_options(opt, parser)
+        validate_anchor_free_options(opt, parser)
         opt.cfg, opt.weights, opt.resume, opt.batch_size, opt.global_rank, opt.local_rank = '', ckpt, True, opt.total_batch_size, *apriori  # reinstate
         logger.info('Resuming training from %s' % ckpt)
     else:
@@ -1170,6 +1197,7 @@ if __name__ == '__main__':
     ensure_loss_option_defaults(opt)
     ensure_aug_option_defaults(opt)
     ensure_structure_option_defaults(opt)
+    validate_anchor_free_options(opt, parser)
 
     # DDP mode
     opt.total_batch_size = opt.batch_size

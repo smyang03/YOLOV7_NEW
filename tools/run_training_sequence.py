@@ -47,6 +47,9 @@ STAGES = [
     StageSpec('11', 'w6_p2_anchor_scdown', {'p2-head': 'anchor', 'neck-mod': 'scdown'}, families='w6', train_type='model_family_export'),
     StageSpec('12', 'optional_gate', {}, defer=True, train_type='optional_gate'),
     StageSpec('13', 'finetune_continual', {}, defer=True, train_type='finetune_distill'),
+    StageSpec('14', 'w6_p2_fcos_hybrid', {'det-head': 'hybrid', 'anchor-free-levels': 'p2'}, families='w6', train_type='anchor_free'),
+    StageSpec('15', 'l_fcos_full', {'det-head': 'fcos', 'anchor-free-levels': 'p3p4p5'}, families='l', train_type='anchor_free'),
+    StageSpec('16', 'w6_fcos_full', {'det-head': 'fcos', 'anchor-free-levels': 'p2p3p4p5p6'}, families='w6', train_type='anchor_free'),
 ]
 
 

@@ -73,3 +73,124 @@ def fcos_contract(raw, stride=4, img_size=None, conf_thres=0.25, topk=1000,
         'decoded_box_count': [int(x.shape[0]) for x in decoded],
         'decoded_shape': [list(x.shape) for x in decoded],
     }
+
+
+def default_level_ranges(strides):
+    base = [
+        (0, 64),
+        (64, 128),
+        (128, 256),
+        (256, 512),
+        (512, 1e8),
+    ]
+    if len(strides) <= 3:
+        return [(0, 64), (64, 128), (128, 1e8)]
+    return base[:len(strides)]
+
+
+def compute_centerness_targets(ltrb_targets):
+    left_right = ltrb_targets[:, [0, 2]]
+    top_bottom = ltrb_targets[:, [1, 3]]
+    centerness = (
+        left_right.min(dim=-1).values / left_right.max(dim=-1).values.clamp(min=1e-6) *
+        top_bottom.min(dim=-1).values / top_bottom.max(dim=-1).values.clamp(min=1e-6)
+    ).clamp(min=0.0)
+    return torch.sqrt(centerness)
+
+
+def _targets_to_xyxy(targets, img_size):
+    h, w = img_size
+    boxes = targets[:, 2:6].clone()
+    boxes[:, [0, 2]] *= w
+    boxes[:, [1, 3]] *= h
+    xyxy = torch.empty_like(boxes)
+    xyxy[:, 0] = boxes[:, 0] - boxes[:, 2] * 0.5
+    xyxy[:, 1] = boxes[:, 1] - boxes[:, 3] * 0.5
+    xyxy[:, 2] = boxes[:, 0] + boxes[:, 2] * 0.5
+    xyxy[:, 3] = boxes[:, 1] + boxes[:, 3] * 0.5
+    xyxy[:, [0, 2]] = xyxy[:, [0, 2]].clamp(0, w)
+    xyxy[:, [1, 3]] = xyxy[:, [1, 3]].clamp(0, h)
+    return xyxy
+
+
+def fcos_targets(targets, feature_shapes, strides, img_size, num_classes,
+                 batch_size, center_radius=1.5, level_ranges=None):
+    device = targets.device
+    level_ranges = level_ranges or default_level_ranges(strides)
+    results = []
+    for height, width in feature_shapes:
+        points = height * width
+        results.append({
+            'labels': torch.full((batch_size, points), num_classes, dtype=torch.long, device=device),
+            'ltrb': torch.zeros((batch_size, points, 4), device=device),
+            'centerness': torch.zeros((batch_size, points), device=device),
+            'pos_mask': torch.zeros((batch_size, points), dtype=torch.bool, device=device),
+        })
+    if targets.numel() == 0:
+        return results
+
+    img_targets = targets.detach()
+    for b in range(batch_size):
+        per_image = img_targets[img_targets[:, 0].long() == b]
+        if per_image.numel() == 0:
+            continue
+        classes = per_image[:, 1].long().clamp(0, num_classes - 1)
+        boxes = _targets_to_xyxy(per_image, img_size)
+        wh = (boxes[:, 2:] - boxes[:, :2]).clamp(min=1e-6)
+        areas = wh[:, 0] * wh[:, 1]
+        centers = (boxes[:, :2] + boxes[:, 2:]) * 0.5
+
+        for level, ((height, width), stride) in enumerate(zip(feature_shapes, strides)):
+            locations = make_locations(height, width, stride, device=device)
+            xs, ys = locations[:, 0:1], locations[:, 1:2]
+            l = xs - boxes[:, 0]
+            t = ys - boxes[:, 1]
+            r = boxes[:, 2] - xs
+            btm = boxes[:, 3] - ys
+            ltrb = torch.stack((l, t, r, btm), dim=-1)
+            inside_box = ltrb.min(dim=-1).values > 0
+
+            radius = center_radius * stride
+            center_boxes = torch.stack((
+                torch.max(boxes[:, 0], centers[:, 0] - radius),
+                torch.max(boxes[:, 1], centers[:, 1] - radius),
+                torch.min(boxes[:, 2], centers[:, 0] + radius),
+                torch.min(boxes[:, 3], centers[:, 1] + radius),
+            ), dim=-1)
+            cl = xs - center_boxes[:, 0]
+            ct = ys - center_boxes[:, 1]
+            cr = center_boxes[:, 2] - xs
+            cb = center_boxes[:, 3] - ys
+            inside_center = torch.stack((cl, ct, cr, cb), dim=-1).min(dim=-1).values > 0
+
+            max_ltrb = ltrb.max(dim=-1).values
+            low, high = level_ranges[level]
+            in_range = (max_ltrb >= low) & (max_ltrb <= high)
+            candidates = inside_box & inside_center & in_range
+            candidate_areas = areas.unsqueeze(0).expand_as(candidates).clone()
+            candidate_areas[~candidates] = float('inf')
+            min_area, matched = candidate_areas.min(dim=1)
+            pos = torch.isfinite(min_area)
+            if not pos.any():
+                continue
+            point_index = pos.nonzero(as_tuple=False).view(-1)
+            gt_index = matched[pos]
+            matched_ltrb = ltrb[point_index, gt_index]
+            results[level]['labels'][b, point_index] = classes[gt_index]
+            results[level]['ltrb'][b, point_index] = matched_ltrb
+            results[level]['centerness'][b, point_index] = compute_centerness_targets(matched_ltrb)
+            results[level]['pos_mask'][b, point_index] = True
+    return results
+
+
+def decode_fcos_outputs(raw_outputs, strides, img_size=None, conf_thres=0.25, topk=1000,
+                        score_mode='sqrt_cls_centerness'):
+    decoded = []
+    for raw, stride in zip(raw_outputs, strides):
+        per_level = decode_fcos_raw(raw, stride=stride, img_size=img_size, conf_thres=conf_thres,
+                                    topk=topk, score_mode=score_mode)
+        if not decoded:
+            decoded = per_level
+        else:
+            decoded = [torch.cat((a, b), 0) for a, b in zip(decoded, per_level)]
+    return decoded

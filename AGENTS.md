@@ -70,3 +70,11 @@ Python 3 기준으로 4칸 들여쓰기를 사용합니다. 기존 YOLOv7 스타
 ## Agent 전용 지침
 
 명시 요청 없이 사용자 데이터, dataset, weight, experiment output을 덮어쓰지 않습니다. 변경 범위는 작게 유지하고, 가능한 기존 학습 동작을 보존합니다. 동작에 영향을 주는 변경은 `doc/`에 기록합니다.
+
+## 브랜치 머지 금지 규칙
+
+`main` 브랜치와 `anchor-free` 브랜치는 **사용자가 명시적으로 지시하기 전까지 절대 머지하지 않습니다.** 이 규칙은 어떠한 상황에서도 예외 없이 적용됩니다. 브랜치 간 머지, rebase, cherry-pick은 사용자의 명확한 요청이 있을 때만 수행합니다.
+
+- 금지: `git merge main`, `git merge anchor-free`
+- 금지: `git rebase main`, `git rebase anchor-free`
+- 금지: `main`과 `anchor-free` 사이의 자동 cherry-pick 또는 충돌 해결
