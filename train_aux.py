@@ -665,7 +665,8 @@ def train(hyp, opt, device, tb_writer=None):
             ema.update_attr(model, include=['yaml', 'nc', 'hyp', 'gr', 'names', 'stride', 'class_weights'])
             final_epoch = epoch + 1 == epochs
             all_val_results = []
-            if not opt.notest or final_epoch:  # Calculate mAP
+            validated_epoch = not opt.notest or final_epoch
+            if validated_epoch:  # Calculate mAP
                 wandb_logger.current_epoch = epoch + 1
 
                 # Evaluate on all validation sets
@@ -741,7 +742,7 @@ def train(hyp, opt, device, tb_writer=None):
 
             # Update best mAP
             fi = fitness(np.array(results).reshape(1, -1))  # weighted combination of [P, R, mAP@.5, mAP@.5-.95]
-            is_best = fi > best_fitness
+            is_best = validated_epoch and fi > best_fitness
             if is_best:
                 best_fitness = fi
             wandb_logger.end_epoch(best_result=is_best)
@@ -758,16 +759,22 @@ def train(hyp, opt, device, tb_writer=None):
                 train_logger.log_scenario_metrics(epoch, active_phase_name, all_val_results)
                 per_class = all_val_results[0]['per_class'] if all_val_results else None
                 train_logger.log_per_class(epoch, active_phase_name, per_class, is_best=is_best)
-            if early_stopper.update(epoch, active_phase_name, fi):
+            if validated_epoch and early_stopper.update(epoch, active_phase_name, fi):
                 logger.info(f'Early stopping at epoch {epoch} in {active_phase_name}')
                 stop_training = True
 
             # Save model
-            if (not opt.nosave) or (final_epoch and not opt.evolve):  # if save
+            save_best_only = getattr(opt, 'save_best_only', False)
+            save_current_best = is_best
+            save_final_fallback = final_epoch and not best.is_file()
+            should_save_ckpt = (not opt.nosave) or (final_epoch and not opt.evolve)
+            if save_best_only:
+                should_save_ckpt = should_save_ckpt and (save_current_best or save_final_fallback)
+            if should_save_ckpt:  # if save
                 ckpt = {
                         'epoch': epoch,
                         'best_fitness': best_fitness,
-                        'training_results': results_file.read_text(),
+                        'training_results': results_file.read_text() if results_file.is_file() else '',
                         'model': deepcopy(model.module if is_parallel(model) else model).half(),
                         'ema': deepcopy(ema.ema).half(),
                         'updates': ema.updates,
@@ -776,13 +783,10 @@ def train(hyp, opt, device, tb_writer=None):
                         'loss_state': build_loss_state(opt, compute_loss),
                         'mosaic_active': dataset.mosaic}
                 # Save last, best and delete
-                save_best_only = getattr(opt, 'save_best_only', False)
-                save_current_best = best_fitness == fi
                 if save_best_only:
-                    if save_current_best or (final_epoch and not best.is_file()):
-                        torch.save(ckpt, best)
-                        if opt.model_saveoptimizer:
-                            strip_optimizer(best)
+                    torch.save(ckpt, best)
+                    if opt.model_saveoptimizer:
+                        strip_optimizer(best)
                 elif opt.model_saveoptimizer:
                     # optimizer 제거하고 저장 (가벼운 모델만)
                     torch.save(ckpt, last)
