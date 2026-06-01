@@ -87,9 +87,12 @@ def quick_stage_overrides(spec, opt):
     epochs = opt.epochs
     if opt.dataset_profile == 'coco128_quick' and spec.stage_id == '01':
         phase_img = opt.img if len(opt.img) == 2 else [opt.img[0], opt.img[0]]
-        flags.setdefault('phase1-epochs', 1)
-        flags.setdefault('phase2-epochs', 1)
-        flags.setdefault('phase3-epochs', 1)
+        if getattr(opt, 'phase1_epochs', None) is None:
+            flags.setdefault('phase1-epochs', 1)
+        if getattr(opt, 'phase2_epochs', None) is None:
+            flags.setdefault('phase2-epochs', 1)
+        if getattr(opt, 'phase3_epochs', None) is None:
+            flags.setdefault('phase3-epochs', 1)
         flags.setdefault('phase2-img', phase_img)
         flags.setdefault('phase3-img', phase_img)
         epochs = max(epochs, 3)
@@ -168,12 +171,16 @@ def build_train_command(opt, config, family):
         command.append('--multi-scale')
     if getattr(opt, 'save_best_only', False):
         command.append('--save-best-only')
+    if getattr(opt, 'notest', False):
+        command.append('--notest')
     for phase_arg in ('phase1_epochs', 'phase2_epochs', 'phase3_epochs'):
         value = getattr(opt, phase_arg, None)
         if value is not None:
             command.extend([f'--{phase_arg.replace("_", "-")}', str(value)])
     if getattr(opt, 'progress_log_interval', None) is not None:
         command.extend(['--progress-log-interval', str(opt.progress_log_interval)])
+    if getattr(opt, 'nccl_timeout', 14400) != 14400:
+        command.extend(['--nccl-timeout', str(opt.nccl_timeout)])
     if getattr(opt, 'debug_log', 'off') != 'off':
         command.extend(['--debug-log', opt.debug_log])
         command.extend(['--debug-log-file', opt.debug_log_file])
@@ -708,6 +715,8 @@ if __name__ == '__main__':
     parser.add_argument('--multi-scale', action='store_true', help='pass multi-scale flag to each training stage')
     parser.add_argument('--save-best-only', action='store_true',
                         help='pass save-best-only flag to each training stage')
+    parser.add_argument('--notest', action='store_true',
+                        help='pass notest flag to each training stage; train.py validates final epoch only')
     parser.add_argument('--phase1-epochs', type=int, default=None,
                         help='pass phase1 epoch count to each training stage')
     parser.add_argument('--phase2-epochs', type=int, default=None,
@@ -727,6 +736,8 @@ if __name__ == '__main__':
                         help='target_full soft fail threshold versus previous success')
     parser.add_argument('--max-gflops-delta-percent', type=float, default=10.0,
                         help='target_full soft fail threshold versus family baseline')
+    parser.add_argument('--nccl-timeout', dest='nccl_timeout', type=int, default=14400,
+                        help='NCCL timeout in seconds passed to each training stage (default: 14400 = 4h)')
     parser.add_argument('--debug-log', choices=['off', 'error', 'debug', 'trace'], default='off')
     parser.add_argument('--debug-log-file', type=str, default='debug_trace.log')
     parser.add_argument('--debug-log-modules', type=str,
