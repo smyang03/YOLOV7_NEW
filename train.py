@@ -653,6 +653,21 @@ def train(hyp, opt, device, tb_writer=None):
                     loss *= opt.world_size  # gradient averaged between devices in DDP mode
                 if opt.quad:
                     loss *= 4.
+                if not torch.isfinite(loss):
+                    stats = getattr(active_loss, 'last_stats', {})
+                    debug_logger.log_event(
+                        'error', 'loss', 'train', 'non_finite_loss',
+                        'non-finite training loss detected',
+                        summary={
+                            'epoch': epoch + 1,
+                            'batch': i + 1,
+                            'loss_items': [float(x) for x in loss_items.detach().cpu()],
+                            'loss_stats': stats,
+                            'det_head': getattr(opt, 'det_head', 'anchor'),
+                        })
+                    raise RuntimeError(
+                        f'non-finite loss at epoch {epoch + 1} batch {i + 1}: '
+                        f'{[float(x) for x in loss_items.detach().cpu()]}')
 
             # Backward
             scaler.scale(loss).backward()

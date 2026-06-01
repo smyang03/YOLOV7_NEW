@@ -16,6 +16,15 @@ def smooth_BCE(eps=0.1):  # https://github.com/ultralytics/yolov3/issues/238#iss
     return 1.0 - 0.5 * eps, 0.5 * eps
 
 
+def sigmoid_focal_loss(logits, targets, alpha=0.25, gamma=2.0):
+    bce = F.binary_cross_entropy_with_logits(logits, targets, reduction='none')
+    prob = torch.sigmoid(logits)
+    p_t = targets * prob + (1.0 - targets) * (1.0 - prob)
+    modulating = (1.0 - p_t).pow(gamma)
+    alpha_t = targets * alpha + (1.0 - targets) * (1.0 - alpha)
+    return alpha_t * modulating * bce
+
+
 class ComputeLossFCOS:
     def __init__(self, model, hyp=None, opt=None):
         device = next(model.parameters()).device
@@ -30,6 +39,8 @@ class ComputeLossFCOS:
         self.cp, self.cn = smooth_BCE(getattr(opt, 'label_smoothing', 0.0) if opt is not None else 0.0)
         self.center_radius = getattr(opt, 'fcos_center_radius', 1.5) if opt is not None else 1.5
         self.loss_box = getattr(opt, 'fcos_loss_box', 'giou') if opt is not None else 'giou'
+        self.focal_alpha = float(self.hyp.get('fcos_alpha', 0.25))
+        self.focal_gamma = float(self.hyp.get('fcos_gamma', 2.0))
         self.last_positive_count = 0
         self.last_stats = {}
         self.device = device
@@ -64,16 +75,19 @@ class ComputeLossFCOS:
                 pos_cls = cls_target[pos_mask]
                 pos_cls[torch.arange(pos_count, device=raw.device), labels[pos_mask]] = self.cp
                 cls_target[pos_mask] = pos_cls
-            lcls = lcls + self.BCEcls(pred[..., 5:], cls_target)
+            lcls = lcls + sigmoid_focal_loss(
+                pred[..., 5:], cls_target,
+                alpha=self.focal_alpha,
+                gamma=self.focal_gamma).sum()
 
             ctr_target = target['centerness']
-            lctr = lctr + self.BCEctr(pred[..., 4], ctr_target)
 
             if pos_count:
                 locations = self._locations(height, width, stride, raw.device)
                 loc = locations.unsqueeze(0).expand(bs, -1, 2)[pos_mask]
-                pred_ltrb = F.relu(pred[..., :4][pos_mask]) * stride
+                pred_ltrb = F.softplus(pred[..., :4][pos_mask]) * stride
                 true_ltrb = target['ltrb'][pos_mask]
+                lctr = lctr + self.BCEctr(pred[..., 4][pos_mask], ctr_target[pos_mask])
                 pred_boxes = torch.stack((
                     loc[:, 0] - pred_ltrb[:, 0],
                     loc[:, 1] - pred_ltrb[:, 1],

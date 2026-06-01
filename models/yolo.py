@@ -313,7 +313,7 @@ class FCOSDetect(nn.Module):
                 if self.grid[i].shape[2:4] != y.shape[2:4]:
                     self.grid[i] = self._make_grid(nx, ny).to(y.device)
                 p = y.permute(0, 2, 3, 1).contiguous()
-                distances = F.relu(p[..., :4]) * self.stride[i]
+                distances = F.softplus(p[..., :4]) * self.stride[i]
                 center = (self.grid[i].view(1, ny, nx, 2) + 0.5) * self.stride[i]
                 x1 = center[..., 0] - distances[..., 0]
                 y1 = center[..., 1] - distances[..., 1]
@@ -342,10 +342,17 @@ class FCOSDetect(nn.Module):
         return torch.stack((xv, yv), 2).view((1, 1, ny, nx, 2)).float()
 
     def initialize_biases(self, cf=None):
+        prior = 0.01
+        cls_bias = math.log(prior / (1.0 - prior))
         for mi, s in zip(self.m, self.stride):
             b = mi.bias.view(-1)
-            b.data[4] += math.log(8 / (640 / s) ** 2)
-            b.data[5:] += math.log(0.6 / (self.nc - 0.99)) if cf is None else torch.log(cf / cf.sum())
+            b.data[:4].fill_(1.0)
+            b.data[4] = 0.0
+            if cf is None:
+                b.data[5:].fill_(cls_bias)
+            else:
+                freq = (cf / cf.sum()).clamp(1e-4, 1.0 - 1e-4)
+                b.data[5:] = torch.log(freq / (1.0 - freq))
             mi.bias = torch.nn.Parameter(b, requires_grad=True)
 
 
