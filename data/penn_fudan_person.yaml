@@ -1,0 +1,5 @@
+train: datasets/penn_fudan_person/person_val.txt
+val: datasets/penn_fudan_person/person_val.txt
+
+nc: 2
+names: ['person', 'head']

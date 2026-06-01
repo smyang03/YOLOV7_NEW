@@ -141,6 +141,7 @@ def launcher_prefix(opt):
 
 
 def build_train_command(opt, config, family):
+    cfg = family_cfg(opt, family)
     command = launcher_prefix(opt) + [
         str(ROOT / 'train.py'),
         '--data', config.data,
@@ -153,8 +154,10 @@ def build_train_command(opt, config, family):
     ]
     if config.start_weight:
         command.extend(['--weights', config.start_weight])
-    elif family_cfg(opt, family):
-        command.extend(['--weights', '', '--cfg', family_cfg(opt, family)])
+        if cfg:
+            command.extend(['--cfg', cfg])
+    elif cfg:
+        command.extend(['--weights', '', '--cfg', cfg])
     elif opt.dry_run:
         command.extend(['--weights', f'<{family}_weights_required_for_real_run>'])
     if opt.hyp:
@@ -205,6 +208,23 @@ def best_weight_path(stage_dir):
     if last.is_file():
         return str(last)
     return ''
+
+
+def validate_stage_config(opt, config, spec):
+    strict_paths = not opt.dry_run and not spec.defer
+    cfg = family_cfg(opt, config.model_family)
+    cfg_scratch_allowed = config.train_type == 'anchor_free'
+    if strict_paths and config.stage_id != '00' and not config.start_weight and cfg and cfg_scratch_allowed:
+        config.validate(strict_paths=False)
+        errors = []
+        if not Path(config.data).is_file():
+            errors.append(f'data yaml not found: {config.data}')
+        if not Path(cfg).is_file():
+            errors.append(f'cfg yaml not found: {cfg}')
+        if errors:
+            raise ValueError('; '.join(errors))
+        return
+    config.validate(strict_paths=strict_paths)
 
 
 def _stream_pipe(pipe, log_handle, console_handle=None):
@@ -563,7 +583,7 @@ class TrainingSequenceRunner:
             if not self.opt.dry_run and config.stage_id != '00':
                 config.start_weight = self.current_weights.get(config.model_family, config.start_weight)
                 config.command = build_train_command(self.opt, config, config.model_family)
-            config.validate(strict_paths=not self.opt.dry_run and not spec.defer)
+            validate_stage_config(self.opt, config, spec)
             write_stage_plan(config)
             stage_dir = Path(config.output_dir)
             if self.opt.resume_sequence and (stage_dir / 'stage_result.yaml').is_file():
