@@ -154,7 +154,7 @@ def write_finetune_results(path, opt, train_images, replay_images, status):
         writer = csv.DictWriter(f, fieldnames=[
             'sub_stage', 'status', 'train_images', 'replay_images', 'replay_ratio',
             'pseudo_conf', 'pseudo_iou_dedup', 'distill_alpha', 'distill_beta',
-            'bn_policy', 'freeze_policy'])
+            'bn_policy', 'freeze_policy', 'best_val_set'])
         writer.writeheader()
         writer.writerow({
             'sub_stage': opt.sub_stage,
@@ -168,6 +168,7 @@ def write_finetune_results(path, opt, train_images, replay_images, status):
             'distill_beta': opt.distill_beta,
             'bn_policy': opt.bn_policy,
             'freeze_policy': opt.freeze_policy,
+            'best_val_set': opt.best_val_set,
         })
 
 
@@ -205,9 +206,12 @@ def train_command(opt, data_yaml, save_dir):
         '--project', str(save_dir.parent),
         '--name', save_dir.name,
         '--exist-ok',
+        '--best-val-set', opt.best_val_set,
         '--bn-policy', opt.bn_policy,
         '--freeze', *[str(x) for x in FREEZE_POLICY_LAYERS[opt.freeze_policy]],
     ]
+    if opt.save_best_only:
+        cmd.append('--save-best-only')
     if opt.cfg:
         cmd.extend(['--cfg', opt.cfg])
     if opt.device:
@@ -269,6 +273,8 @@ def main(opt):
         'distill_beta': opt.distill_beta,
         'bn_policy': opt.bn_policy,
         'freeze_policy': opt.freeze_policy,
+        'best_val_set': opt.best_val_set,
+        'save_best_only': opt.save_best_only,
         'sub_stage': opt.sub_stage,
         'dry_run': opt.dry_run,
         'status': 'dry_run' if opt.dry_run else 'pending',
@@ -320,6 +326,10 @@ if __name__ == '__main__':
     parser.add_argument('--bn-policy', choices=['train', 'eval'], default='train')
     parser.add_argument('--freeze-policy', '--freeze', dest='freeze_policy',
                         choices=['none', 'backbone', 'partial', 'neck_lower'], default='none')
+    parser.add_argument('--best-val-set', type=str, default='first',
+                        help='validation set used for best.pt selection: first, last, combined, or a named val set')
+    parser.add_argument('--save-best-only', action='store_true',
+                        help='pass through to train.py to save only weights/best.pt')
     parser.add_argument('--sub-stage', type=str, default='1.3.7-E1')
     parser.add_argument('--seed', type=int, default=0)
     parser.add_argument('--dry-run', action='store_true')
