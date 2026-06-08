@@ -44,6 +44,8 @@ def parse_results_detail(path):
     overall = []
     per_class = []
     current_epoch = None
+    if not path.is_file():
+        return overall, per_class
     for line in path.read_text(encoding='utf-8-sig', errors='ignore').splitlines():
         match = OVERALL_RE.match(line)
         if match:
@@ -153,7 +155,12 @@ def summarize_run(run_dir, baseline, baseline_classes, opt):
     path = detail_path(run_dir)
     overall, per_class = parse_results_detail(path)
     if not overall:
-        return {'run': str(run_dir), 'status': 'no_results_detail'}
+        return {
+            'run': str(run_dir),
+            'results_detail': str(path),
+            'status': 'missing_results_detail' if not path.is_file() else 'empty_results_detail',
+            'best_weight': str(Path(run_dir) / 'weights' / 'best.pt'),
+        }
     select_epoch, select_score = best_epoch(overall, opt.select_scenario)
     scenarios = scenario_names(overall)
     finetune_scenario = opt.finetune_scenario or (scenarios[0] if scenarios else '')
