@@ -1,6 +1,7 @@
 import argparse
 import csv
 import json
+import math
 import subprocess
 import sys
 from pathlib import Path
@@ -99,6 +100,16 @@ def load_replay_images(replay_buffer):
     return []
 
 
+def replay_request(opt, train_image_count):
+    if opt.replay_count >= 0:
+        return float(opt.replay_count), int(opt.replay_count)
+    ratio = float(opt.replay_ratio)
+    if opt.replay_ratio_source == 'finetune' and 0 < ratio <= 1:
+        count = max(1, int(math.ceil(int(train_image_count) * ratio)))
+        return float(count), count
+    return ratio, None
+
+
 def build_train_data(opt, save_dir):
     data_path = Path(opt.data)
     data = load_yaml(data_path)
@@ -106,11 +117,16 @@ def build_train_data(opt, save_dir):
     replay_images = load_replay_images(opt.replay_buffer)
     replay_manifest_path = save_dir / 'replay_manifest.json'
 
-    if not replay_images and opt.replay_ratio > 0:
+    replay_value, replay_requested_count = replay_request(opt, len(train_images))
+
+    if not replay_images and replay_value > 0:
         manifest = ReplayBufferBuilder(
             opt.base_data,
-            replay_ratio=opt.replay_ratio,
+            replay_ratio=replay_value,
             seed=opt.seed).build(output=replay_manifest_path)
+        manifest['replay_ratio_source'] = opt.replay_ratio_source
+        manifest['replay_requested_count'] = replay_requested_count
+        save_json(replay_manifest_path, manifest)
         replay_images = [x['image'] for x in manifest.get('selected_images', [])]
     elif replay_images:
         save_json(replay_manifest_path, {
@@ -118,6 +134,8 @@ def build_train_data(opt, save_dir):
             'source_data': opt.base_data,
             'source_split': 'external_replay_buffer',
             'replay_ratio': opt.replay_ratio,
+            'replay_ratio_source': opt.replay_ratio_source,
+            'replay_requested_count': replay_requested_count,
             'selected_count': len(replay_images),
             'selected_images': [{'image': x, 'label': '', 'classes': []} for x in replay_images],
             'selection_seed': opt.seed,
@@ -129,6 +147,8 @@ def build_train_data(opt, save_dir):
             'source_data': opt.base_data,
             'source_split': 'train',
             'replay_ratio': opt.replay_ratio,
+            'replay_ratio_source': opt.replay_ratio_source,
+            'replay_requested_count': replay_requested_count,
             'selected_count': 0,
             'selected_images': [],
             'selection_seed': opt.seed,
@@ -144,7 +164,7 @@ def build_train_data(opt, save_dir):
 
     output_data = save_dir / 'finetune_data.yaml'
     save_yaml(output_data, data)
-    return output_data, len(train_images), len(replay_images), replay_manifest_path
+    return output_data, len(train_images), len(replay_images), replay_manifest_path, replay_requested_count
 
 
 def write_finetune_results(path, opt, train_images, replay_images, status):
@@ -153,6 +173,7 @@ def write_finetune_results(path, opt, train_images, replay_images, status):
     with path.open('w', newline='', encoding='utf-8') as f:
         writer = csv.DictWriter(f, fieldnames=[
             'sub_stage', 'status', 'train_images', 'replay_images', 'replay_ratio',
+            'replay_ratio_source', 'replay_requested_count',
             'pseudo_conf', 'pseudo_iou_dedup', 'distill_alpha', 'distill_beta',
             'bn_policy', 'freeze_policy', 'best_val_set'])
         writer.writeheader()
@@ -162,6 +183,8 @@ def write_finetune_results(path, opt, train_images, replay_images, status):
             'train_images': train_images,
             'replay_images': replay_images,
             'replay_ratio': opt.replay_ratio,
+            'replay_ratio_source': opt.replay_ratio_source,
+            'replay_requested_count': opt.replay_requested_count,
             'pseudo_conf': opt.pseudo_conf,
             'pseudo_iou_dedup': opt.pseudo_iou_dedup,
             'distill_alpha': opt.distill_alpha,
@@ -243,7 +266,8 @@ def main(opt):
     if mapping_result['status'] != 'pass':
         raise SystemExit(f'class mapping check failed: {mapping_output}')
 
-    data_yaml, train_images, replay_images, replay_manifest = build_train_data(opt, save_dir)
+    data_yaml, train_images, replay_images, replay_manifest, replay_requested_count = build_train_data(opt, save_dir)
+    opt.replay_requested_count = replay_requested_count
     dataset_manifest = save_dir / 'dataset_manifest.json'
     write_dataset_manifest(data_yaml, dataset_manifest)
     pseudo_manifest, merge_report = write_skip_artifacts(save_dir, opt)
@@ -265,6 +289,9 @@ def main(opt):
         'base_weights': opt.base_weights,
         'teacher_weights': opt.teacher_weights,
         'replay_ratio': opt.replay_ratio,
+        'replay_ratio_source': opt.replay_ratio_source,
+        'replay_count': opt.replay_count,
+        'replay_requested_count': replay_requested_count,
         'train_images': train_images,
         'replay_images': replay_images,
         'pseudo_conf': opt.pseudo_conf,
@@ -318,6 +345,10 @@ if __name__ == '__main__':
     parser.add_argument('--mapping-file', type=str, default='')
     parser.add_argument('--replay-buffer', type=str, default='')
     parser.add_argument('--replay-ratio', type=float, default=0.3)
+    parser.add_argument('--replay-ratio-source', choices=['base', 'finetune'], default='base',
+                        help='when replay-ratio <= 1, choose whether the ratio is based on base or finetune train count')
+    parser.add_argument('--replay-count', type=int, default=-1,
+                        help='explicit replay image count; overrides --replay-ratio when >= 0')
     parser.add_argument('--pseudo-conf', type=float, default=0.5)
     parser.add_argument('--pseudo-iou-dedup', type=float, default=0.8)
     parser.add_argument('--distill-alpha', type=str, default='0.0')

@@ -10,9 +10,26 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.append(str(ROOT))
 
-from utils.datasets import img2label_paths, img_formats
-
 TEXT_ENCODINGS = ('utf-8', 'cp949', 'euc-kr', 'latin1', 'utf-16')
+img_formats = ('bmp', 'jpg', 'jpeg', 'png', 'tif', 'tiff', 'dng', 'webp', 'mpo')
+
+
+def img2label_paths(img_paths):
+    replacements = (
+        ('/images/', '/labels/'),
+        ('/JPEGImages/', '/labels/'),
+        ('\\images\\', '\\labels\\'),
+        ('\\JPEGImages\\', '\\labels\\'),
+    )
+    label_paths = []
+    for x in img_paths:
+        x = str(x)
+        for src, dst in replacements:
+            if src in x:
+                x = x.replace(src, dst, 1)
+                break
+        label_paths.append(str(Path(x).with_suffix('.txt')))
+    return label_paths
 
 
 def file_sha256(path):
