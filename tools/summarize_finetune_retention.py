@@ -18,6 +18,10 @@ OVERALL_RE = re.compile(
     rf'^\s*(?P<epoch>\d+)/(?P<epochs>\d+).*?\[\s*(?P<scenario>[^\]]+)\]\s+'
     rf'(?P<precision>{NUM})\s+(?P<recall>{NUM})\s+(?P<map50>{NUM})\s+(?P<map50_95>{NUM})'
 )
+FOLLOWUP_OVERALL_RE = re.compile(
+    rf'^\s*\[\s*(?P<scenario>[^\]]+)\]\s+'
+    rf'(?P<precision>{NUM})\s+(?P<recall>{NUM})\s+(?P<map50>{NUM})\s+(?P<map50_95>{NUM})'
+)
 CLASS_RE = re.compile(
     rf'^\s*\[\s*(?P<scenario>[^\]]+)\]\[\s*(?P<class_name>[^\]]+)\]\s+'
     rf'Images:\s*(?P<images>\d+),\s*P:\s*(?P<precision>{NUM}),\s*R:\s*(?P<recall>{NUM}),\s*'
@@ -50,6 +54,15 @@ def parse_results_detail(path):
         match = OVERALL_RE.match(line)
         if match:
             current_epoch = int(match.group('epoch'))
+            row = {
+                'epoch': current_epoch,
+                'scenario': match.group('scenario').strip(),
+                **_metric_dict(match),
+            }
+            overall.append(row)
+            continue
+        match = FOLLOWUP_OVERALL_RE.match(line)
+        if match and current_epoch is not None:
             row = {
                 'epoch': current_epoch,
                 'scenario': match.group('scenario').strip(),
